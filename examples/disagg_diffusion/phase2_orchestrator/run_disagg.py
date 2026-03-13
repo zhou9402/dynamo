@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Disaggregated Diffusion Orchestrator — HTTP Server with Pipeline Parallelism
@@ -11,9 +11,8 @@ Pipeline parallelism: multiple requests can be in different stages
 simultaneously. Per-stage semaphores control backpressure so each
 GPU processes one request at a time, while the pipeline stays full.
 
-    Request 1:  [Encoder] → [Denoiser] → [  VAE  ]
-    Request 2:             [Encoder] → [Denoiser] → [  VAE  ]
-    Request 3:                        [Encoder] → [Denoiser] → ...
+Each stage worker runs its own StageEngine, providing per-stage health metrics
+(queue depth, active requests, GPU memory) queryable via /health/stages.
 
 Usage:
     python run_disagg.py [--port 8080]
@@ -21,6 +20,7 @@ Usage:
 API:
     POST /v1/videos/generations
     GET  /health
+    GET  /health/stages
     GET  /pipeline/status
     GET  /videos/<filename>
 """
@@ -39,7 +39,10 @@ import uvloop
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "phase1_workers"))
 
-from protocol import DenoiserRequest, EncoderRequest, VAEDecodeRequest  # noqa: E402
+from protocol import (  # noqa: E402
+    DenoiserRequest, EncoderRequest, VAEDecodeRequest,
+    HealthRequest,
+)
 from dynamo.runtime import DistributedRuntime, dynamo_worker  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -47,7 +50,6 @@ logger = logging.getLogger(__name__)
 PORT = int(os.environ.get("PORT", "8080"))
 HOST = os.environ.get("HOST", "0.0.0.0")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/disagg_videos")
-# Max requests allowed in the pipeline at once (prevents OOM from queuing).
 MAX_PIPELINE_DEPTH = int(os.environ.get("MAX_PIPELINE_DEPTH", "4"))
 
 
@@ -64,13 +66,29 @@ async def call_stage(client, request_json: str) -> dict:
     return result
 
 
+async def query_stage_health(health_client, stage_name: str) -> dict:
+    """Query a stage's StageEngine health via its Dynamo health endpoint."""
+    try:
+        health_req = HealthRequest()
+        stream = await health_client.generate(health_req.model_dump_json())
+        result = None
+        async for chunk in stream:
+            data = chunk.data() if hasattr(chunk, "data") else chunk
+            if isinstance(data, str):
+                data = json.loads(data)
+            result = data
+        return {"stage": stage_name, **result} if result else {"stage": stage_name, "error": "empty response"}
+    except Exception as e:
+        return {"stage": stage_name, "error": str(e)}
+
+
 class PipelineTracker:
     """Tracks requests flowing through the 3-stage pipeline."""
 
     STAGES = ("encoder", "denoiser", "vae")
 
     def __init__(self):
-        self._active: Dict[str, str] = {}   # request_id → current stage
+        self._active: Dict[str, str] = {}
         self._completed = 0
         self._failed = 0
         self._stage_times: Dict[str, list] = defaultdict(list)
@@ -122,6 +140,16 @@ async def worker(runtime: DistributedRuntime):
     denoiser_client = await ns.component("denoiser").endpoint("generate").client()
     vae_client = await ns.component("vae").endpoint("generate").client()
 
+    encoder_health_client = await ns.component("encoder").endpoint("health").client()
+    denoiser_health_client = await ns.component("denoiser").endpoint("health").client()
+    vae_health_client = await ns.component("vae").endpoint("health").client()
+
+    health_clients = {
+        "encoder": encoder_health_client,
+        "denoiser": denoiser_health_client,
+        "vae": vae_health_client,
+    }
+
     logger.info("Waiting for stage workers …")
     await encoder_client.wait_for_instances()
     await denoiser_client.wait_for_instances()
@@ -130,16 +158,11 @@ async def worker(runtime: DistributedRuntime):
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # --- Pipeline parallelism primitives ---
-    # Per-stage semaphores: each stage has 1 GPU, so allow 1 concurrent
-    # compute per stage. Requests queue at the semaphore boundary,
-    # creating natural pipeline overlap.
     stage_sems = {
         "encoder": asyncio.Semaphore(1),
         "denoiser": asyncio.Semaphore(1),
         "vae": asyncio.Semaphore(1),
     }
-    # Overall admission control to prevent unbounded queuing.
     admission = asyncio.Semaphore(MAX_PIPELINE_DEPTH)
     tracker = PipelineTracker()
 
@@ -160,7 +183,6 @@ async def worker(runtime: DistributedRuntime):
         timings: Dict[str, float] = {}
 
         async with admission:
-            # Stage 1: Encoder
             enc_req = EncoderRequest(
                 prompt=request["prompt"],
                 negative_prompt=request.get("negative_prompt", "Blurry, low quality, distorted"),
@@ -170,7 +192,6 @@ async def worker(runtime: DistributedRuntime):
                 "encoder", request_id, encoder_client, enc_req.model_dump_json(),
             )
 
-            # Stage 2: Denoiser
             den_req = DenoiserRequest(
                 transfer_meta=enc_resp["transfer_meta"],
                 height=request.get("height", 480),
@@ -184,7 +205,6 @@ async def worker(runtime: DistributedRuntime):
                 "denoiser", request_id, denoiser_client, den_req.model_dump_json(),
             )
 
-            # Stage 3: VAE — writes mp4 to shared storage, returns filename.
             vae_req = VAEDecodeRequest(
                 transfer_meta=den_resp["transfer_meta"],
                 request_id=request_id,
@@ -197,14 +217,12 @@ async def worker(runtime: DistributedRuntime):
         await tracker.mark_done(request_id)
         logger.info("[%s] Total: %.2fs", request_id, timings["total_s"])
 
-        # VAE wrote the file directly — just reference it.
         filename = vae_resp["video_path"]
         resp_format = request.get("response_format", "url")
 
         if resp_format == "url":
             data = [{"url": f"/videos/{filename}"}]
         else:
-            # Fallback: read the file and base64 encode on-demand.
             import base64
             filepath = os.path.join(OUTPUT_DIR, filename)
             with open(filepath, "rb") as f:
@@ -217,7 +235,6 @@ async def worker(runtime: DistributedRuntime):
             "timings": timings,
         }
 
-    # --- HTTP server ---
     from aiohttp import web
 
     async def handle_post(http_request: web.Request) -> web.Response:
@@ -234,13 +251,21 @@ async def worker(runtime: DistributedRuntime):
     async def handle_health(http_request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
 
+    async def handle_stages_health(http_request: web.Request) -> web.Response:
+        results = await asyncio.gather(
+            *[
+                query_stage_health(client, name)
+                for name, client in health_clients.items()
+            ]
+        )
+        return web.json_response({"stages": list(results)})
+
     async def handle_pipeline_status(http_request: web.Request) -> web.Response:
         status = await tracker.status()
         return web.json_response(status)
 
     async def handle_video(http_request: web.Request) -> web.Response:
         filename = http_request.match_info["filename"]
-        # Prevent path traversal.
         if "/" in filename or "\\" in filename or ".." in filename:
             return web.json_response({"error": "invalid filename"}, status=400)
         filepath = os.path.join(OUTPUT_DIR, filename)
@@ -248,24 +273,62 @@ async def worker(runtime: DistributedRuntime):
             return web.json_response({"error": "not found"}, status=404)
         return web.FileResponse(filepath, headers={"Content-Type": "video/mp4"})
 
+    async def handle_index(http_request: web.Request) -> web.Response:
+        files = sorted(
+            [f for f in os.listdir(OUTPUT_DIR) if f.endswith(".mp4")],
+            key=lambda f: os.path.getmtime(os.path.join(OUTPUT_DIR, f)),
+            reverse=True,
+        ) if os.path.isdir(OUTPUT_DIR) else []
+        latest = files[0] if files else None
+        video_tag = (
+            f'<video src="/videos/{latest}" controls autoplay loop '
+            f'style="max-width:100%;max-height:80vh"></video>'
+            if latest else "<p>No videos generated yet.</p>"
+        )
+        history = "".join(
+            f'<li><a href="/videos/{f}">{f}</a></li>' for f in files[:20]
+        )
+        html = (
+            "<!DOCTYPE html><html><head><title>Disagg Diffusion</title>"
+            "<style>body{font-family:sans-serif;margin:2em;background:#111;color:#eee}"
+            "a{color:#4af}video{border-radius:8px}</style></head><body>"
+            f"<h2>Latest Video</h2>{video_tag}"
+            f"<h3>History</h3><ul>{history}</ul></body></html>"
+        )
+        return web.Response(text=html, content_type="text/html")
+
     http_app = web.Application()
+    http_app.router.add_get("/", handle_index)
     http_app.router.add_post("/v1/videos/generations", handle_post)
     http_app.router.add_get("/health", handle_health)
+    http_app.router.add_get("/health/stages", handle_stages_health)
     http_app.router.add_get("/pipeline/status", handle_pipeline_status)
     http_app.router.add_get("/videos/{filename}", handle_video)
 
     runner = web.AppRunner(http_app)
     await runner.setup()
-    site = web.TCPSite(runner, HOST, PORT)
-    await site.start()
 
-    logger.info("Server listening on http://%s:%d (pipeline depth=%d)", HOST, PORT, MAX_PIPELINE_DEPTH)
+    bound_port = PORT
+    for attempt in range(10):
+        try:
+            site = web.TCPSite(runner, HOST, bound_port, reuse_address=True)
+            await site.start()
+            break
+        except OSError as e:
+            if e.errno == 98 and attempt < 9:
+                logger.warning("Port %d in use, trying %d", bound_port, bound_port + 1)
+                bound_port += 1
+            else:
+                raise
+
+    logger.info("Server listening on http://%s:%d (pipeline depth=%d)", HOST, bound_port, MAX_PIPELINE_DEPTH)
+    logger.info("  GET  /                        <- latest video preview")
     logger.info("  POST /v1/videos/generations")
     logger.info("  GET  /health")
+    logger.info("  GET  /health/stages")
     logger.info("  GET  /pipeline/status")
     logger.info("  GET  /videos/<id>.mp4")
 
-    # Keep alive forever
     await asyncio.Event().wait()
 
 

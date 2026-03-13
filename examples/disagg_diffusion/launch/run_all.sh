@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Disaggregated Diffusion POC — all-in-one launcher (Wan video model)
@@ -28,6 +28,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 WORKERS_DIR="${SCRIPT_DIR}/phase1_workers"
 ORCH_DIR="${SCRIPT_DIR}/phase2_orchestrator"
 
+# If dynamo.sglang components are available, add them to PYTHONPATH.
+# Handlers fall back to local shims when the components package is absent.
+COMPONENTS_SRC="${SCRIPT_DIR}/../../components/src"
+if [[ -d "${COMPONENTS_SRC}" ]]; then
+    export PYTHONPATH="${COMPONENTS_SRC}:${PYTHONPATH:-}"
+fi
+
 echo "============================================"
 echo "  Disaggregated Diffusion POC (Wan)"
 echo "  Model:  ${MODEL_PATH}"
@@ -44,9 +51,14 @@ cleanup() {
         kill "$pid" 2>/dev/null || true
     done
     wait 2>/dev/null
+    # Clean stale endpoint registrations from etcd
+    etcdctl del --prefix "disagg_diffusion/" >/dev/null 2>&1 || true
     echo "Done."
 }
 trap cleanup EXIT
+
+# Clean stale registrations from previous runs
+etcdctl del --prefix "disagg_diffusion/" >/dev/null 2>&1 || true
 
 if [[ "${SINGLE_GPU:-0}" == "1" ]]; then
     GPU_ENC=0; GPU_DEN=0; GPU_VAE=0
@@ -79,8 +91,25 @@ sleep "${WAIT_SECS}"
 
 # --- Run orchestrator -----------------------------------------------------
 
+PORT="${PORT:-8080}"
+export PORT
+
+# Kill any stale orchestrator on the same port from a previous run.
+# fuser/lsof may not be installed in all containers — guard each attempt.
+set +e
+if command -v fuser >/dev/null 2>&1; then
+    fuser -k "${PORT}/tcp" >/dev/null 2>&1
+elif command -v lsof >/dev/null 2>&1; then
+    _STALE_PID="$(lsof -t -i:"${PORT}" 2>/dev/null)"
+    if [ -n "${_STALE_PID:-}" ]; then
+        kill -9 ${_STALE_PID} 2>/dev/null
+    fi
+fi
+set -e
+sleep 1
+
 echo ""
-echo "Running orchestrator …"
+echo "Running orchestrator (port ${PORT}) …"
 echo ""
 
 export OUTPUT="/tmp/disagg_output.mp4"

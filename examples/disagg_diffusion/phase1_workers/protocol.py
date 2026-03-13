@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Protocol types for disaggregated diffusion stages.
@@ -204,3 +204,23 @@ class GenerateRequest(BaseModel):
     num_inference_steps: int = 20
     guidance_scale: float = 5.0
     seed: int = 42
+
+
+# ---------------------------------------------------------------------------
+# Health (per-stage engine metrics)
+# ---------------------------------------------------------------------------
+
+class HealthRequest(BaseModel):
+    pass
+
+
+class HealthResponse(BaseModel):
+    running: bool = False
+    queue_depth: int = 0
+    max_queue_depth: int = 0
+    active_requests: int = 0
+    total_processed: int = 0
+    avg_latency_s: float = 0.0
+    last_latency_s: float = 0.0
+    gpu_memory_allocated_mb: float = 0.0
+    gpu_memory_reserved_mb: float = 0.0
