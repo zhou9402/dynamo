@@ -81,7 +81,7 @@ def build_partial_pipeline(
     Auto-detects pipeline class from model_index.json, suppresses automatic
     stage creation, and syncs all component configs (even unloaded ones).
     """
-    from sglang.multimodal_gen.runtime.pipelines import get_model_info
+    from sglang.multimodal_gen.runtime.pipelines_core import get_model_info
 
     model_info = get_model_info(server_args.model_path)
     base_pipeline_cls = model_info.pipeline_cls
@@ -95,7 +95,7 @@ def build_partial_pipeline(
     def _safe_init(self, **kwargs):
         # Call ComposedPipelineBase.__init__ directly, skipping LoRAPipeline
         # which tries to access self.modules['transformer']
-        from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
+        from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
             ComposedPipelineBase,
         )
         ComposedPipelineBase.__init__(self, **kwargs)
@@ -248,21 +248,19 @@ def build_config(server_args):
 def build_req(
     prompt: str,
     negative_prompt: Optional[str] = "",
-    height: int = 480,
-    width: int = 832,
-    num_frames: int = 17,
-    num_inference_steps: int = 20,
-    guidance_scale: float = 5.0,
+    height: int = 544,
+    width: int = 960,
+    num_frames: int = 61,
+    num_inference_steps: int = 50,
+    guidance_scale: float = 1.0,
     seed: int = 42,
     device: str = "cuda",
     **extra_fields,
 ) -> "Req":
     """Construct a minimal SGLang ``Req`` for running pipeline stages."""
-    from sglang.multimodal_gen.configs.sample.base import DataType
-    from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
     req = Req(
-        data_type=DataType.VIDEO,
         prompt=prompt,
         negative_prompt=negative_prompt,
         height=height,

@@ -6,7 +6,7 @@
 Provides GPU-direct tensor transfer between stage workers. Only small
 metadata (shapes, dtypes, NIXL descriptor ~1.5 KB) travels over the ZMQ
 control plane; actual tensor data (embeddings, latents) transfers
-GPU→GPU via NIXL RDMA.
+GPU->GPU via NIXL RDMA.
 
 Usage inside PipelineStage.forward() (synchronous context)::
 
@@ -39,10 +39,10 @@ except ImportError:
 class _PersistentConnector:
     """Lazily-initialized NIXL Connector singleton per process."""
 
-    _instance: Optional[nixl_connect.Connector] = None if NIXL_AVAILABLE else None
+    _instance = None
 
     @classmethod
-    async def get(cls) -> nixl_connect.Connector:
+    async def get(cls):
         if cls._instance is None:
             cls._instance = nixl_connect.Connector()
             await cls._instance.initialize()

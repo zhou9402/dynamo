@@ -85,9 +85,9 @@ def _patch_hunyuan_config_task_type():
     default value, so ``HunyuanConfig()`` crashes.  Wrap __init__ to supply
     ``task_type=T2V`` when omitted.  Idempotent.
     """
-    from sglang.multimodal_gen.configs.pipelines.base import ModelTaskType
+    from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
     try:
-        from sglang.multimodal_gen.configs.pipelines.hunyuan import (
+        from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
             HunyuanConfig, FastHunyuanConfig,
         )
     except ImportError:
@@ -401,9 +401,9 @@ async def main():
         logger.info("All stages launched in %.1fs", time.monotonic() - t_launch)
 
         # ── Connect clients ──────────────────────────────────────────
-        enc_client = StageClient(enc_args.scheduler_endpoint(), "encoder")
-        den_client = StageClient(den_args.scheduler_endpoint(), "denoiser")
-        vae_client = StageClient(vae_args.scheduler_endpoint(), "vae")
+        enc_client = StageClient(enc_args.scheduler_endpoint, "encoder")
+        den_client = StageClient(den_args.scheduler_endpoint, "denoiser")
+        vae_client = StageClient(vae_args.scheduler_endpoint, "vae")
 
         # ── Warmup ───────────────────────────────────────────────────
         logger.info("Warmup request …")

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""PartialGPUWorker, IntermediateOutputStage, and subprocess launcher.
+"""PartialGPUWorker, NixlSendStage, NixlReceiveStage, and subprocess launcher.
 
 This module is the single source of truth for disaggregated diffusion's
 integration with sglang.  Everything that runs **inside the Scheduler
@@ -20,12 +20,15 @@ Architecture::
                                                      └─ pipeline.forward()
     SchedulerClient  ◄────ZMQ────►       Scheduler.event_loop()
 
-``IntermediateOutputStage`` is appended as the last pipeline stage for
-encoder / denoiser.  It packages ``Req`` tensors into ``OutputBatch``
-so the result travels through ZMQ as a standard ``OutputBatch``.
+``NixlSendStage`` is appended as the last pipeline stage for
+encoder / denoiser.  It registers ``Req`` tensors as NIXL-readable and
+returns an ``OutputBatch`` with NIXL metadata.
+
+``NixlReceiveStage`` is prepended at the start of denoiser / VAE
+pipelines.  It RDMA-pulls tensors from the previous stage.
 
 ``DecodingStage`` (VAE) already returns ``OutputBatch``, so no extra
-stage is needed for the VAE worker.
+send stage is needed for the VAE worker.
 """
 
 from __future__ import annotations
@@ -54,8 +57,8 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req, OutputBatch
-from sglang.multimodal_gen.runtime.pipelines.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req, OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 # layerwise_offload may not exist in all sglang versions — guard import
@@ -68,7 +71,7 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# IntermediateOutputStage
+# NIXL Pipeline Stages (run inside Scheduler subprocess)
 # ═══════════════════════════════════════════════════════════════════════
 
 
@@ -150,10 +153,19 @@ class NixlSendStage(PipelineStage):
         self._output_fields = output_fields
         self._sender = None
 
+    @staticmethod
+    def _make_timings():
+        """Create a RequestTimings so gpu_worker.execute_forward doesn't crash."""
+        try:
+            from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
+            return RequestTimings(request_id="nixl")
+        except Exception:
+            return None
+
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         tensors = self._extract_tensors(batch)
         if not tensors:
-            return OutputBatch(output={})
+            return OutputBatch(output={}, timings=self._make_timings())
 
         from nixl_transfer import NIXL_AVAILABLE
         if NIXL_AVAILABLE:
@@ -193,7 +205,7 @@ class NixlSendStage(PipelineStage):
         meta = self._sender.send(gpu_tensors)
         # Include CPU metadata tensors directly (e.g. __count fields)
         meta["cpu_tensors"] = cpu_tensors
-        return OutputBatch(output={"_nixl_transfer_meta": meta})
+        return OutputBatch(output={"_nixl_transfer_meta": meta}, timings=self._make_timings())
 
     def _fallback_send(self, tensors: Dict[str, torch.Tensor]) -> OutputBatch:
         """Fallback: send raw tensors via ZMQ pickle."""
@@ -215,7 +227,7 @@ class NixlSendStage(PipelineStage):
                 real_key = base[6:]
                 output[real_key] = [idx_map[i] for i in sorted(idx_map)]
                 del output[base]
-        return OutputBatch(output=output)
+        return OutputBatch(output=output, timings=self._make_timings())
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -224,12 +236,12 @@ class NixlSendStage(PipelineStage):
 
 
 def build_encoder_stages(pipeline, server_args):
-    """TextEncodingStage → IntermediateOutputStage(prompt_embeds, …).
+    """TextEncodingStage → NixlSendStage(prompt_embeds, …).
 
     Automatically detects all loaded text encoders/tokenizers so that
     both single-encoder (Wan) and dual-encoder (HunyuanVideo) models work.
     """
-    from sglang.multimodal_gen.runtime.pipelines.stages.text_encoding import (
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
         TextEncodingStage,
     )
     from sglang_utils import get_component_backend
@@ -261,14 +273,14 @@ def build_encoder_stages(pipeline, server_args):
 
 
 def build_denoiser_stages(pipeline, server_args):
-    """DeviceMove → LatentPrep → TimestepPrep → Denoising → IntermediateOutput."""
-    from sglang.multimodal_gen.runtime.pipelines.stages.latent_preparation import (
+    """NixlReceive → LatentPrep → TimestepPrep → Denoising → NixlSend."""
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
         LatentPreparationStage,
     )
-    from sglang.multimodal_gen.runtime.pipelines.stages.timestep_preparation import (
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation import (
         TimestepPreparationStage,
     )
-    from sglang.multimodal_gen.runtime.pipelines.stages.denoising import (
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
         DenoisingStage,
     )
     from sglang_utils import get_component_backend
@@ -288,7 +300,7 @@ def build_denoiser_stages(pipeline, server_args):
 
 def build_vae_stages(pipeline, server_args):
     """NixlReceive → DecodingStage."""
-    from sglang.multimodal_gen.runtime.pipelines.stages.decoding import (
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
         DecodingStage,
     )
     from sglang_utils import get_component_backend

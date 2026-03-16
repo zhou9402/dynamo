@@ -1,136 +1,150 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-"""Disaggregated Diffusion — Denoiser Worker
+"""Disaggregated Diffusion — Denoiser Worker (Dynamo RPC)
 
-Loads only the Transformer (DiT) and scheduler.  Accepts pre-computed
-embeddings and returns denoised latents (skips VAE decode).
+Wraps SGLang Scheduler subprocess(es) running NixlReceiveStage + Denoising +
+NixlSendStage. Supports TP via launch_partial_server(tp_size=N).
 
-Usage:
-    python denoiser_worker.py --model black-forest-labs/FLUX.1-schnell
+Process architecture::
+
+    Dynamo Worker Process (this file)
+    |-- @dynamo_worker
+    |   |-- serve_endpoint("generate")  <-- Dynamo RPC from orchestrator
+    |   |   +-- handle_generate()
+    |   |       +-- StageClient.forward()  <-- ZMQ to local Scheduler
+    |   +-- serve_endpoint("health")
+    |
+    +-- SGLang Scheduler subprocess(es) (spawned by launch_partial_server)
+        +-- PartialGPUWorker (TP=N)
+            |-- NixlReceiveStage  <-- RDMA-pull embeddings from encoder
+            |-- LatentPreparationStage
+            |-- TimestepPreparationStage
+            |-- DenoisingStage
+            +-- NixlSendStage  <-- register latents as NIXL-readable
 """
 
 import asyncio
+import json
 import logging
+import multiprocessing as mp
 import os
 import sys
 
-import torch
 import uvloop
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from protocol import (  # noqa: E402
-    DenoiserRequest,
-    DenoiserResponse,
-    b64_to_tensors,
-    tensors_to_b64,
-)
-
-from dynamo.runtime import DistributedRuntime, dynamo_endpoint, dynamo_worker  # noqa: E402
+from dynamo.runtime import DistributedRuntime, dynamo_worker  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "black-forest-labs/FLUX.1-schnell")
-DEVICE = os.environ.get("DEVICE", "cuda")
+MODEL_PATH = os.environ.get("MODEL_PATH", "hunyuanvideo-community/HunyuanVideo")
+SCHEDULER_PORT = int(os.environ.get("SCHEDULER_PORT", "15700"))
 
 
-class DenoiserStage:
-    """Denoiser stage: embeddings → latents (no text encoder, no VAE)."""
-
-    def __init__(self):
-        self.pipe = None
-        self.vae_scaling_factor = 1.0
-        self.vae_shift_factor = None
-
-    def load_model(self):
-        from diffusers import FluxPipeline
-
-        logger.info("Loading transformer from %s …", MODEL_PATH)
-        self.pipe = FluxPipeline.from_pretrained(
-            MODEL_PATH, torch_dtype=torch.bfloat16
-        )
-        self.pipe.to(DEVICE)
-
-        # Capture VAE config before discarding
-        self.vae_scaling_factor = self.pipe.vae.config.scaling_factor
-        self.vae_shift_factor = getattr(self.pipe.vae.config, "shift_factor", None)
-
-        # Free text encoders + VAE
-        self.pipe.text_encoder = None
-        self.pipe.text_encoder_2 = None
-        self.pipe.tokenizer = None
-        self.pipe.tokenizer_2 = None
-        self.pipe.vae = None
-        torch.cuda.empty_cache()
-
-        vram = torch.cuda.memory_allocated() / 1e6
-        logger.info("Denoiser ready — VRAM: %.0f MB (transformer only)", vram)
-
-    @dynamo_endpoint(DenoiserRequest, DenoiserResponse)
-    async def generate(self, request: DenoiserRequest):
-        logger.info(
-            "Denoising %dx%d, %d steps, seed=%d",
-            request.width, request.height,
-            request.num_inference_steps, request.seed,
-        )
-
-        embeddings = b64_to_tensors(request.embeddings_b64, DEVICE)
-        generator = torch.Generator(device=DEVICE).manual_seed(request.seed)
-
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: self.pipe(
-                prompt_embeds=embeddings["prompt_embeds"],
-                pooled_prompt_embeds=embeddings["pooled_prompt_embeds"],
-                num_inference_steps=request.num_inference_steps,
-                guidance_scale=request.guidance_scale,
-                generator=generator,
-                height=request.height,
-                width=request.width,
-                output_type="latent",
-            ),
-        )
-        latents = result.images
-
-        latent_payload = {
-            "latents": latents,
-            "scaling_factor": torch.tensor(self.vae_scaling_factor),
-        }
-        if self.vae_shift_factor is not None:
-            latent_payload["shift_factor"] = torch.tensor(self.vae_shift_factor)
-
-        response = DenoiserResponse(
-            latents_b64=tensors_to_b64(latent_payload),
-            shape=list(latents.shape),
-        )
-        logger.info("Denoised — latents %s", list(latents.shape))
-        yield response.model_dump()
-
-
-@dynamo_worker()
+@dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
-    endpoint = runtime.endpoint("disagg_diffusion.denoiser.generate")
+    from run_e2e_sglang import (
+        _patch_hunyuan_config_task_type,
+        StageClient,
+    )
+    from partial_gpu_worker import build_denoiser_stages, launch_partial_server
+    from sglang.multimodal_gen.runtime.server_args import (
+        ServerArgs, set_global_server_args,
+    )
+    from sglang_utils import build_req
 
-    stage = DenoiserStage()
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, stage.load_model)
+    _patch_hunyuan_config_task_type()
 
-    logger.info("Serving denoiser endpoint: disagg_diffusion.denoiser.generate")
-    await endpoint.serve_endpoint(stage.generate)
+    # Auto-detect GPU count from CUDA_VISIBLE_DEVICES
+    num_gpus = len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))
+    tp_size = int(os.environ.get("TP_SIZE", str(num_gpus)))
+
+    server_args = ServerArgs.from_kwargs(
+        model_path=MODEL_PATH,
+        num_gpus=num_gpus,
+        tp_size=tp_size,
+        scheduler_port=SCHEDULER_PORT,
+    )
+    set_global_server_args(server_args)
+
+    logger.info(
+        "Launching denoiser Scheduler: num_gpus=%d, tp=%d, port=%d",
+        num_gpus, tp_size, SCHEDULER_PORT,
+    )
+    processes = launch_partial_server(
+        server_args,
+        required_modules=["transformer", "scheduler"],
+        custom_stages_fn=build_denoiser_stages,
+    )
+
+    # Connect ZMQ client to local Scheduler
+    client = StageClient(server_args.scheduler_endpoint, "denoiser")
+
+    # ── Dynamo RPC handlers ──────────────────────────────────────────
+
+    async def handle_generate(request, context):
+        try:
+            if isinstance(request, str):
+                request = json.loads(request)
+
+            req = build_req(
+                prompt="(embeddings via NIXL)",
+                negative_prompt="",
+                height=request.get("height", 544),
+                width=request.get("width", 960),
+                num_frames=request.get("num_frames", 61),
+                num_inference_steps=request.get("num_inference_steps", 50),
+                guidance_scale=request.get("guidance_scale", 1.0),
+                seed=request.get("seed", 42),
+            )
+            req.do_classifier_free_guidance = (req.guidance_scale > 1.0)
+
+            # Pass NIXL metadata for NixlReceiveStage to RDMA-pull embeddings
+            transfer_meta = request.get("transfer_meta", {})
+            if transfer_meta:
+                req._nixl_transfer_meta = transfer_meta
+
+            output = await client.forward([req])
+            if output.error:
+                yield {"error": str(output.error), "transfer_meta": {}, "shape": []}
+                return
+
+            result = output.output
+            transfer_meta_out = result.get("_nixl_transfer_meta", {})
+            logger.info("Denoised — NIXL latent metadata ready")
+            yield {"transfer_meta": transfer_meta_out, "shape": []}
+
+        except Exception as e:
+            logger.error("Denoiser generate failed: %s", e, exc_info=True)
+            yield {"error": str(e), "transfer_meta": {}, "shape": []}
+
+    async def handle_health(request, context):
+        yield {
+            "status": "ok", "stage": "denoiser",
+            "model": MODEL_PATH, "tp_size": tp_size,
+        }
+
+    # ── Serve Dynamo endpoints ───────────────────────────────────────
+
+    ns = runtime.namespace("disagg_diffusion")
+    gen_ep = ns.component("denoiser").endpoint("generate")
+    health_ep = ns.component("denoiser").endpoint("health")
+
+    logger.info("Serving: disagg_diffusion.denoiser.generate + health")
+    try:
+        await asyncio.gather(
+            gen_ep.serve_endpoint(handle_generate),
+            health_ep.serve_endpoint(handle_health),
+        )
+    finally:
+        client.close()
+        for p in processes:
+            p.terminate()
+        for p in processes:
+            p.join(timeout=10)
 
 
 if __name__ == "__main__":
@@ -138,5 +152,6 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     )
+    mp.set_start_method("spawn", force=True)
     uvloop.install()
     asyncio.run(worker())

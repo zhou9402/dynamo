@@ -1,116 +1,179 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-"""Disaggregated Diffusion — VAE Worker
+"""Disaggregated Diffusion — VAE Worker (Dynamo RPC)
 
-Loads only the VAE decoder.  Accepts denoised latents and returns
-the final image as base64-encoded PNG.
+Wraps an SGLang Scheduler subprocess running NixlReceiveStage + DecodingStage.
+Receives latents via NIXL RDMA, decodes to video frames, saves as mp4.
 
-Usage:
-    python vae_worker.py --model black-forest-labs/FLUX.1-schnell
+Process architecture::
+
+    Dynamo Worker Process (this file)
+    |-- @dynamo_worker
+    |   |-- serve_endpoint("generate")  <-- Dynamo RPC from orchestrator
+    |   |   +-- handle_generate()
+    |   |       +-- StageClient.forward()  <-- ZMQ to local Scheduler
+    |   +-- serve_endpoint("health")
+    |
+    +-- SGLang Scheduler subprocess (spawned by launch_partial_server)
+        +-- PartialGPUWorker
+            |-- NixlReceiveStage  <-- RDMA-pull latents from denoiser
+            +-- DecodingStage     <-- VAE decode to video frames
 """
 
 import asyncio
-import base64
-import io
+import json
 import logging
+import multiprocessing as mp
 import os
 import sys
+import uuid
 
 import numpy as np
-import torch
 import uvloop
-from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from protocol import VAEDecodeRequest, VAEDecodeResponse, b64_to_tensors  # noqa: E402
-
-from dynamo.runtime import DistributedRuntime, dynamo_endpoint, dynamo_worker  # noqa: E402
+from dynamo.runtime import DistributedRuntime, dynamo_worker  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "black-forest-labs/FLUX.1-schnell")
-DEVICE = os.environ.get("DEVICE", "cuda")
+MODEL_PATH = os.environ.get("MODEL_PATH", "hunyuanvideo-community/HunyuanVideo")
+SCHEDULER_PORT = int(os.environ.get("SCHEDULER_PORT", "15800"))
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/disagg_videos")
 
 
-class VAEStage:
-    """VAE decode stage: latents → image pixels."""
-
-    def __init__(self):
-        self.vae = None
-
-    def load_model(self):
-        from diffusers import AutoencoderKL
-
-        logger.info("Loading VAE from %s …", MODEL_PATH)
-        self.vae = AutoencoderKL.from_pretrained(
-            MODEL_PATH, subfolder="vae", torch_dtype=torch.bfloat16
-        )
-        self.vae.to(DEVICE)
-
-        vram = torch.cuda.memory_allocated() / 1e6
-        logger.info("VAE ready — VRAM: %.0f MB", vram)
-
-    @dynamo_endpoint(VAEDecodeRequest, VAEDecodeResponse)
-    async def generate(self, request: VAEDecodeRequest):
-        logger.info("Decoding latents …")
-
-        data = b64_to_tensors(request.latents_b64, DEVICE)
-        latents = data["latents"]
-        scaling_factor = data["scaling_factor"].item()
-        shift_factor = data.get("shift_factor")
-        if shift_factor is not None:
-            shift_factor = shift_factor.item()
-
-        # Undo pipeline's latent scaling
-        if shift_factor is not None:
-            latents = latents / scaling_factor + shift_factor
-        else:
-            latents = latents / scaling_factor
-
-        loop = asyncio.get_event_loop()
-
-        def _decode():
-            with torch.no_grad():
-                decoded = self.vae.decode(latents, return_dict=False)[0]
-            decoded = (decoded / 2 + 0.5).clamp(0, 1)
-            return decoded.cpu().permute(0, 2, 3, 1).float().numpy()
-
-        pixels = await loop.run_in_executor(None, _decode)
-
-        img = Image.fromarray((pixels[0] * 255).round().astype(np.uint8))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-
-        response = VAEDecodeResponse(image_b64=image_b64)
-        logger.info("Decoded — image %dx%d", img.width, img.height)
-        yield response.model_dump()
-
-
-@dynamo_worker()
+@dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
-    endpoint = runtime.endpoint("disagg_diffusion.vae.generate")
+    from run_e2e_sglang import (
+        _patch_hunyuan_config_task_type,
+        StageClient,
+    )
+    from partial_gpu_worker import build_vae_stages, launch_partial_server
+    from sglang.multimodal_gen.runtime.server_args import (
+        ServerArgs, set_global_server_args,
+    )
+    from sglang_utils import build_req
 
-    stage = VAEStage()
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, stage.load_model)
+    _patch_hunyuan_config_task_type()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    logger.info("Serving VAE endpoint: disagg_diffusion.vae.generate")
-    await endpoint.serve_endpoint(stage.generate)
+    server_args = ServerArgs.from_kwargs(
+        model_path=MODEL_PATH,
+        num_gpus=1,
+        tp_size=1,
+        scheduler_port=SCHEDULER_PORT,
+    )
+    set_global_server_args(server_args)
+
+    logger.info("Launching VAE Scheduler: port=%d", SCHEDULER_PORT)
+    processes = launch_partial_server(
+        server_args,
+        required_modules=["vae", "scheduler"],
+        custom_stages_fn=build_vae_stages,
+    )
+
+    # Connect ZMQ client to local Scheduler
+    client = StageClient(server_args.scheduler_endpoint, "vae")
+
+    # ── Dynamo RPC handlers ──────────────────────────────────────────
+
+    async def handle_generate(request, context):
+        try:
+            if isinstance(request, str):
+                request = json.loads(request)
+
+            req = build_req(
+                prompt="",
+                height=request.get("height", 544),
+                width=request.get("width", 960),
+                num_frames=request.get("num_frames", 61),
+                num_inference_steps=1,
+                guidance_scale=0.0,
+                seed=request.get("seed", 42),
+            )
+
+            # Pass NIXL metadata for NixlReceiveStage to RDMA-pull latents
+            transfer_meta = request.get("transfer_meta", {})
+            if transfer_meta:
+                req._nixl_transfer_meta = transfer_meta
+
+            output = await client.forward([req])
+            if output.error:
+                yield {"error": str(output.error), "video_path": "", "num_frames": 0}
+                return
+
+            # Extract frames and save video
+            frames_tensor = output.output
+            request_id = request.get("request_id") or str(uuid.uuid4())[:8]
+
+            loop = asyncio.get_event_loop()
+            filename, n_frames = await loop.run_in_executor(
+                None, _save_video_frames, frames_tensor, request_id,
+            )
+            logger.info("Decoded — %d frames -> %s", n_frames, filename)
+            yield {"video_path": filename, "num_frames": n_frames}
+
+        except Exception as e:
+            logger.error("VAE generate failed: %s", e, exc_info=True)
+            yield {"error": str(e), "video_path": "", "num_frames": 0}
+
+    async def handle_health(request, context):
+        yield {"status": "ok", "stage": "vae", "model": MODEL_PATH}
+
+    # ── Serve Dynamo endpoints ───────────────────────────────────────
+
+    ns = runtime.namespace("disagg_diffusion")
+    gen_ep = ns.component("vae").endpoint("generate")
+    health_ep = ns.component("vae").endpoint("health")
+
+    logger.info("Serving: disagg_diffusion.vae.generate + health")
+    try:
+        await asyncio.gather(
+            gen_ep.serve_endpoint(handle_generate),
+            health_ep.serve_endpoint(handle_health),
+        )
+    finally:
+        client.close()
+        for p in processes:
+            p.terminate()
+        for p in processes:
+            p.join(timeout=10)
+
+
+def _save_video_frames(frames_tensor, request_id: str) -> tuple:
+    """Save decoded frames as mp4. Returns (filename, num_frames)."""
+    import torch
+
+    if isinstance(frames_tensor, dict):
+        # OutputBatch may return dict — extract the video tensor
+        for v in frames_tensor.values():
+            if hasattr(v, "shape"):
+                frames_tensor = v
+                break
+
+    if hasattr(frames_tensor, "cpu"):
+        frames_tensor = frames_tensor.cpu().float().numpy()
+
+    # [B, C, T, H, W] -> [T, H, W, C]
+    frames = (frames_tensor[0].transpose(1, 2, 3, 0) * 255).clip(0, 255).astype(np.uint8)
+
+    filename = f"{request_id}.mp4"
+    filepath = os.path.join(OUTPUT_DIR, filename)
+
+    try:
+        import imageio
+        imageio.mimwrite(filepath, frames, fps=24, codec="libx264")
+    except Exception as e:
+        logger.warning("mp4 export failed (%s), saving first frame as PNG", e)
+        from PIL import Image
+        img = Image.fromarray(frames[0])
+        filepath = filepath.replace(".mp4", ".png")
+        filename = filename.replace(".mp4", ".png")
+        img.save(filepath)
+
+    return filename, len(frames)
 
 
 if __name__ == "__main__":
@@ -118,5 +181,6 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     )
+    mp.set_start_method("spawn", force=True)
     uvloop.install()
     asyncio.run(worker())
