@@ -44,21 +44,18 @@ SCHEDULER_PORT = int(os.environ.get("SCHEDULER_PORT", "15600"))
 
 @dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
-    from run_e2e_sglang import (
-        _patch_hunyuan_config_task_type,
-        _detect_encoder_modules,
-        StageClient,
+    from sglang_utils import (
+        StageClient, patch_hunyuan_config, detect_encoder_modules, build_req,
     )
     from partial_gpu_worker import build_encoder_stages, launch_partial_server
     from sglang.multimodal_gen.runtime.server_args import (
         ServerArgs, set_global_server_args,
     )
-    from sglang_utils import build_req
 
-    _patch_hunyuan_config_task_type()
+    patch_hunyuan_config()
 
     # Launch SGLang Scheduler subprocess with text encoder stages
-    enc_modules = _detect_encoder_modules(MODEL_PATH)
+    enc_modules = detect_encoder_modules(MODEL_PATH)
     server_args = ServerArgs.from_kwargs(
         model_path=MODEL_PATH,
         num_gpus=1,

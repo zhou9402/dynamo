@@ -6,10 +6,14 @@
 Provides helpers to construct ServerArgs, load partial pipelines (only the
 modules each worker needs), and convert between Dynamo protocol types and
 SGLang's Req dataclass.
+
+Also contains shared utilities (StageClient, model detection, compatibility
+patches) used by both Dynamo workers and the standalone E2E script.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, Dict, List, Optional
@@ -191,60 +195,6 @@ def get_component_backend(module) -> str:
     return f"unknown ({mod}.{cls})"
 
 
-def build_config(server_args):
-    """Construct a minimal Config from a diffusion ServerArgs."""
-    import types
-
-    try:
-        from dynamo.sglang.args import Config, DynamoConfig
-        dynamo_args = DynamoConfig.__new__(DynamoConfig)
-    except ImportError:
-        dynamo_args = types.SimpleNamespace()
-        Config = None
-
-    dynamo_args.component = "disagg_diffusion"
-    dynamo_args.namespace = "disagg_diffusion"
-    dynamo_args.diffusion_worker = True
-    dynamo_args.use_kv_events = False
-    dynamo_args.media_output_fs_url = "file:///tmp/disagg_videos"
-    dynamo_args.media_output_http_url = None
-    dynamo_args.use_sglang_tokenizer = False
-    dynamo_args.multimodal_processor = False
-    dynamo_args.multimodal_encode_worker = False
-    dynamo_args.multimodal_worker = False
-    dynamo_args.embedding_worker = False
-    dynamo_args.image_diffusion_worker = False
-    dynamo_args.video_generation_worker = False
-    dynamo_args.disagg_config = None
-    dynamo_args.disagg_config_key = None
-    dynamo_args.endpoint = "generate"
-    dynamo_args.discovery_backend = "etcd"
-    dynamo_args.request_plane = "tcp"
-    dynamo_args.event_plane = "tcp"
-    dynamo_args.connector = []
-    dynamo_args.enable_local_indexer = False
-    dynamo_args.durable_kv_events = False
-    dynamo_args.endpoint_types = "generate"
-    dynamo_args.dump_config_to = None
-    dynamo_args.multimodal_embedding_cache_capacity_gb = 0.0
-    dynamo_args.output_modalities = ["video"]
-    dynamo_args.dyn_tool_call_parser = None
-    dynamo_args.dyn_reasoning_parser = None
-    dynamo_args.custom_jinja_template = None
-
-    if not hasattr(server_args, "disaggregation_mode"):
-        server_args.disaggregation_mode = "null"
-
-    if Config is not None:
-        return Config(server_args, dynamo_args)
-
-    cfg = types.SimpleNamespace()
-    cfg.server_args = server_args
-    cfg.dynamo_args = dynamo_args
-    cfg.serving_mode = getattr(server_args, "disaggregation_mode", "null")
-    return cfg
-
-
 def build_req(
     prompt: str,
     negative_prompt: Optional[str] = "",
@@ -337,3 +287,114 @@ def inject_tensors_to_req(
         else:
             setattr(req, key, value)
     return req
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Shared utilities — used by Dynamo workers and the standalone E2E script
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class StageClient:
+    """Async ZMQ REQ client that talks to a SGLang Scheduler subprocess."""
+
+    def __init__(self, endpoint: str, name: str = ""):
+        import zmq.asyncio
+        self._name = name
+        self._ctx = zmq.asyncio.Context()
+        self._sock = self._ctx.socket(zmq.REQ)
+        self._sock.connect(endpoint)
+        self._lock = asyncio.Lock()
+        logger.info("StageClient(%s) connected to %s", name, endpoint)
+
+    async def forward(self, reqs):
+        """Send request(s) and receive response."""
+        async with self._lock:
+            await self._sock.send_pyobj(reqs)
+            return await self._sock.recv_pyobj()
+
+    def close(self):
+        self._sock.close()
+        self._ctx.term()
+
+
+def patch_hunyuan_config():
+    """HunyuanConfig inherits ``task_type`` from PipelineConfig without a
+    default value, so ``HunyuanConfig()`` crashes.  Wrap __init__ to supply
+    ``task_type=T2V`` when omitted.  Idempotent.
+    """
+    from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+    try:
+        from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
+            HunyuanConfig, FastHunyuanConfig,
+        )
+    except ImportError:
+        return
+
+    for cls in (HunyuanConfig, FastHunyuanConfig):
+        if getattr(cls, "_task_type_patched", False):
+            continue
+        orig = cls.__init__
+
+        def _patched(self, *a, task_type=ModelTaskType.T2V, _orig=orig, **kw):
+            _orig(self, *a, task_type=task_type, **kw)
+
+        cls.__init__ = _patched
+        cls._task_type_patched = True
+
+
+def detect_encoder_modules(model_path: str) -> List[str]:
+    """Return the required_modules list for the encoder stage.
+
+    Auto-detects dual-encoder models (e.g. HunyuanVideo with Llama + CLIP).
+    """
+    try:
+        from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+            maybe_download_model_index, verify_model_config_and_directory,
+        )
+        config = (verify_model_config_and_directory(model_path)
+                  if os.path.exists(model_path)
+                  else maybe_download_model_index(model_path))
+        modules = ["text_encoder", "tokenizer"]
+        if "text_encoder_2" in config:
+            modules += ["text_encoder_2", "tokenizer_2"]
+        modules.append("scheduler")
+        return modules
+    except Exception:
+        pass
+    # Fallback: include dual encoders for known models
+    if "hunyuan" in model_path.lower():
+        return ["text_encoder", "text_encoder_2",
+                "tokenizer", "tokenizer_2", "scheduler"]
+    return ["text_encoder", "tokenizer", "scheduler"]
+
+
+def save_video(frames_tensor, output_path: str, fps: int = 24):
+    """Save decoded video tensor [B,C,T,H,W] as mp4.
+
+    Returns (filepath, num_frames).
+    """
+    import numpy as np
+
+    if isinstance(frames_tensor, dict):
+        for v in frames_tensor.values():
+            if hasattr(v, "shape"):
+                frames_tensor = v
+                break
+
+    if hasattr(frames_tensor, "cpu"):
+        frames_tensor = frames_tensor.cpu().float().numpy()
+
+    # [B, C, T, H, W] -> [T, H, W, C]
+    frames = (frames_tensor[0].transpose(1, 2, 3, 0) * 255).clip(0, 255).astype(np.uint8)
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    try:
+        import imageio
+        imageio.mimwrite(output_path, frames, fps=fps, codec="libx264")
+    except Exception as e:
+        logger.warning("mp4 export failed (%s), saving first frame as PNG", e)
+        from PIL import Image
+        output_path = output_path.rsplit(".", 1)[0] + ".png"
+        Image.fromarray(frames[0]).save(output_path)
+
+    return output_path, len(frames)

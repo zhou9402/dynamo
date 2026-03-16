@@ -30,7 +30,6 @@ import os
 import sys
 import uuid
 
-import numpy as np
 import uvloop
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -46,17 +45,13 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/disagg_videos")
 
 @dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
-    from run_e2e_sglang import (
-        _patch_hunyuan_config_task_type,
-        StageClient,
-    )
+    from sglang_utils import StageClient, patch_hunyuan_config, build_req, save_video
     from partial_gpu_worker import build_vae_stages, launch_partial_server
     from sglang.multimodal_gen.runtime.server_args import (
         ServerArgs, set_global_server_args,
     )
-    from sglang_utils import build_req
 
-    _patch_hunyuan_config_task_type()
+    patch_hunyuan_config()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     server_args = ServerArgs.from_kwargs(
@@ -107,11 +102,13 @@ async def worker(runtime: DistributedRuntime):
             # Extract frames and save video
             frames_tensor = output.output
             request_id = request.get("request_id") or str(uuid.uuid4())[:8]
+            out_path = os.path.join(OUTPUT_DIR, f"{request_id}.mp4")
 
             loop = asyncio.get_event_loop()
-            filename, n_frames = await loop.run_in_executor(
-                None, _save_video_frames, frames_tensor, request_id,
+            filepath, n_frames = await loop.run_in_executor(
+                None, save_video, frames_tensor, out_path,
             )
+            filename = os.path.basename(filepath)
             logger.info("Decoded — %d frames -> %s", n_frames, filename)
             yield {"video_path": filename, "num_frames": n_frames}
 
@@ -140,40 +137,6 @@ async def worker(runtime: DistributedRuntime):
             p.terminate()
         for p in processes:
             p.join(timeout=10)
-
-
-def _save_video_frames(frames_tensor, request_id: str) -> tuple:
-    """Save decoded frames as mp4. Returns (filename, num_frames)."""
-    import torch
-
-    if isinstance(frames_tensor, dict):
-        # OutputBatch may return dict — extract the video tensor
-        for v in frames_tensor.values():
-            if hasattr(v, "shape"):
-                frames_tensor = v
-                break
-
-    if hasattr(frames_tensor, "cpu"):
-        frames_tensor = frames_tensor.cpu().float().numpy()
-
-    # [B, C, T, H, W] -> [T, H, W, C]
-    frames = (frames_tensor[0].transpose(1, 2, 3, 0) * 255).clip(0, 255).astype(np.uint8)
-
-    filename = f"{request_id}.mp4"
-    filepath = os.path.join(OUTPUT_DIR, filename)
-
-    try:
-        import imageio
-        imageio.mimwrite(filepath, frames, fps=24, codec="libx264")
-    except Exception as e:
-        logger.warning("mp4 export failed (%s), saving first frame as PNG", e)
-        from PIL import Image
-        img = Image.fromarray(frames[0])
-        filepath = filepath.replace(".mp4", ".png")
-        filename = filename.replace(".mp4", ".png")
-        img.save(filepath)
-
-    return filename, len(frames)
 
 
 if __name__ == "__main__":

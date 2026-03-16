@@ -46,17 +46,13 @@ SCHEDULER_PORT = int(os.environ.get("SCHEDULER_PORT", "15700"))
 
 @dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
-    from run_e2e_sglang import (
-        _patch_hunyuan_config_task_type,
-        StageClient,
-    )
+    from sglang_utils import StageClient, patch_hunyuan_config, build_req
     from partial_gpu_worker import build_denoiser_stages, launch_partial_server
     from sglang.multimodal_gen.runtime.server_args import (
         ServerArgs, set_global_server_args,
     )
-    from sglang_utils import build_req
 
-    _patch_hunyuan_config_task_type()
+    patch_hunyuan_config()
 
     # Auto-detect GPU count from CUDA_VISIBLE_DEVICES
     num_gpus = len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))
