@@ -1,8 +1,8 @@
 # Disaggregated Diffusion Inference (HunyuanVideo)
 
-Split a monolithic video diffusion pipeline into independent stages on separate GPUs.
+Split a monolithic video diffusion pipeline into independent Dynamo workers on separate GPUs.
 Tensor data transfers between stages use **NIXL RDMA** (GPU-direct); only small metadata
-travels over the control plane.
+travels over Dynamo RPC.
 
 Supports HunyuanVideo (13B, dual Llama+CLIP encoder) and Wan2.2-TI2V models.
 
@@ -10,8 +10,8 @@ Supports HunyuanVideo (13B, dual Llama+CLIP encoder) and Wan2.2-TI2V models.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        Orchestrator (HTTP API)                      │
-│                     run_disagg.py / run_e2e_sglang.py               │
+│                     Orchestrator (HTTP API)                         │
+│                        run_disagg.py                                │
 └──────┬──────────────────────┬───────────────────────────┬───────────┘
        │ Dynamo RPC           │ Dynamo RPC                │ Dynamo RPC
        │ (metadata)           │ (metadata)                │ (metadata)
@@ -35,16 +35,16 @@ Supports HunyuanVideo (13B, dual Llama+CLIP encoder) and Wan2.2-TI2V models.
 ### Request Flow
 
 ```
-1. User ──POST /v1/videos/generations──► Orchestrator
-2. Orchestrator ──EncoderRequest──► Encoder Worker
-3.   Encoder: TextEncoding → NixlSendStage (register embeddings on GPU)
-4.   Encoder ──{nixl_metadata}──► Orchestrator
-5. Orchestrator ──DenoiserRequest + nixl_meta──► Denoiser Worker
-6.   Denoiser: NixlReceive (RDMA pull embeddings) → LatentPrep → Denoise (50 steps) → NixlSend
-7.   Denoiser ──{nixl_metadata}──► Orchestrator
-8. Orchestrator ──VAERequest + nixl_meta──► VAE Worker
-9.   VAE: NixlReceive (RDMA pull latents) → Decode → Save MP4
-10.  VAE ──{video_path}──► Orchestrator ──► User
+ 1. User ──POST /v1/videos/generations──► Orchestrator
+ 2. Orchestrator ──EncoderRequest──► Encoder Worker
+ 3.   Encoder: TextEncoding → NixlSendStage (register embeddings on GPU)
+ 4.   Encoder ──{nixl_metadata}──► Orchestrator
+ 5. Orchestrator ──DenoiserRequest + nixl_meta──► Denoiser Worker
+ 6.   Denoiser: NixlReceive (RDMA pull embeddings) → LatentPrep → Denoise (N steps) → NixlSend
+ 7.   Denoiser ──{nixl_metadata}──► Orchestrator
+ 8. Orchestrator ──VAERequest + nixl_meta──► VAE Worker
+ 9.   VAE: NixlReceive (RDMA pull latents) → Decode → Save MP4
+10.   VAE ──{video_path}──► Orchestrator ──► User
 ```
 
 ### Worker Internal Architecture
@@ -73,34 +73,27 @@ Request 2:               [ Encoder ] ──► [ Denoiser ~~~~~~~~ ] ──► [
 Request 3:                            [ Encoder ] ──► [ Denoiser ~~~~~~~~ ]
 ```
 
-## Quick Start — Single Script (Recommended)
+## Quick Start
 
-Launches all 3 stages + runs the full pipeline in one command. No etcd needed.
+One script launches everything (etcd + 3 workers + orchestrator):
 
 ```bash
 conda activate omni
 export HF_HUB_CACHE=/path/to/huggingface/hub
 
-# Default: 61 frames, 50 steps, 544x960, ~8 min on 4x H20 GPUs
-python phase1_workers/run_e2e_sglang.py
+# Launch all services + send a test request
+./run_all.sh --test
 
-# Custom prompt
-PROMPT="A golden retriever running on a sunny beach" python phase1_workers/run_e2e_sglang.py
+# Quick smoke test (9 frames, 3 steps, ~30s)
+./run_all.sh --test --quick
 
-# Quick smoke test (~30s)
-NUM_FRAMES=9 NUM_STEPS=3 python phase1_workers/run_e2e_sglang.py
+# Just launch services (no test request)
+./run_all.sh
 ```
 
-Output: `/tmp/disagg_e2e/output_0.mp4`
-
-## Multi-Process Deployment (Dynamo RPC)
-
-For production use with independent workers and HTTP API:
+Or launch each service manually:
 
 ```bash
-conda activate omni
-export HF_HUB_CACHE=/path/to/huggingface/hub
-
 # Terminal 0: etcd
 etcd --data-dir /tmp/etcd_disagg --listen-client-urls http://0.0.0.0:2379
 
@@ -109,12 +102,13 @@ CUDA_VISIBLE_DEVICES=0   python phase1_workers/encoder_worker.py
 CUDA_VISIBLE_DEVICES=1,2 python phase1_workers/denoiser_worker.py
 CUDA_VISIBLE_DEVICES=3   python phase1_workers/vae_worker.py
 
-# Terminal 4: HTTP Orchestrator
+# Terminal 4: Orchestrator
 python phase2_orchestrator/run_disagg.py
 ```
 
+Generate a video (61 frames, 50 steps, 544x960 by default):
+
 ```bash
-# Generate video (61 frames, 50 steps by default)
 curl -X POST http://localhost:8080/v1/videos/generations \
   -H "Content-Type: application/json" \
   -d '{"prompt": "A golden retriever running on a sunny beach with waves crashing"}'
@@ -133,13 +127,10 @@ curl -X POST http://localhost:8080/v1/videos/generations \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MODEL_PATH` | `hunyuanvideo-community/HunyuanVideo` | HuggingFace model ID or local path |
-| `NUM_FRAMES` | `61` | Number of video frames (~2.5s at 24fps) |
-| `NUM_STEPS` | `50` | Denoising steps (more = higher quality) |
-| `HEIGHT` / `WIDTH` | `544` / `960` | Output resolution |
-| `GUIDANCE` | `1.0` | Guidance scale (1.0 = embedded guidance) |
-| `GPU_ENC` / `GPU_DEN` / `GPU_VAE` | `0` / `1,2` / `3` | GPU assignment |
+| `GPU_ENC` / `GPU_DEN` / `GPU_VAE` | `0` / `1,2` / `3` | GPU assignment per stage |
 | `TP_SIZE` | auto from `GPU_DEN` | Tensor parallelism for denoiser |
-| `OUTPUT_DIR` | `/tmp/disagg_e2e` | Video output directory |
+| `PORT` | `8080` | Orchestrator HTTP port |
+| `OUTPUT_DIR` | `/tmp/disagg_videos` | Video output directory |
 
 ## Supported Models
 
@@ -148,15 +139,11 @@ curl -X POST http://localhost:8080/v1/videos/generations \
 
 ## Roadmap
 
-- [ ] **Dynamo RPC data plane** — replace NIXL with Dynamo's native tensor transport
-- [ ] **Multi-node** — distribute stages across machines (currently single-node only)
-- [ ] **Dynamic batching** — batch multiple prompts per denoiser pass
-- [ ] **LoRA hot-swap** — switch LoRA adapters without restarting workers
-- [ ] **Speculative decoding** — use smaller DiT for early steps, full DiT for final steps
-- [ ] **Streaming output** — stream decoded frames as they're produced
-- [ ] **HunyuanVideo 1.5** — upgrade to latest HunyuanVideo with improved quality
-- [ ] **Wan2.2 14B** — support larger Wan model with TP
-- [ ] **Profiling dashboard** — per-stage latency, GPU utilization, NIXL throughput metrics
+- [ ] **Dynamic scaling** — auto-scale workers based on queue depth, add/remove denoiser replicas
+- [ ] **Streaming output** — stream decoded frames to client as they are produced
+- [ ] **Orchestrator improvements** — smarter scheduling, request priority, load balancing across replicas
+- [ ] **Metrics & observability** — per-stage latency, GPU utilization, NIXL throughput, Prometheus export
+- [ ] **Request cancellation** — cancel in-flight requests, free GPU resources immediately
 
 ## Dependencies
 
