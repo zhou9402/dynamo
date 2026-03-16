@@ -51,7 +51,14 @@ CUDA_VISIBLE_DEVICES=3 python phase1_workers/vae_worker.py
 python phase2_orchestrator/run_disagg.py
 ```
 
-Test:
+Test (high quality, 61 frames / ~2.5s video, 50 denoising steps):
+```bash
+curl -X POST http://localhost:8080/v1/videos/generations \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "A golden retriever running on a sunny beach with waves crashing in the background"}'
+```
+
+Quick test (lower quality, faster):
 ```bash
 curl -X POST http://localhost:8080/v1/videos/generations \
   -H "Content-Type: application/json" \
@@ -60,11 +67,21 @@ curl -X POST http://localhost:8080/v1/videos/generations \
 
 ### Standalone E2E (no Dynamo, no etcd)
 
-Single-process launcher that starts all 3 stages and runs the pipeline:
+Single-process launcher that starts all 3 stages and runs the pipeline.
+Default: 61 frames, 50 steps, 544x960 resolution (~8 min on 4x H20 GPUs):
 
 ```bash
+# High quality (default: 61 frames, 50 steps, 544x960)
 python phase1_workers/run_e2e_sglang.py
+
+# Custom prompt
+PROMPT="A golden retriever running on a sunny beach" python phase1_workers/run_e2e_sglang.py
+
+# Quick test (faster, lower quality)
+NUM_FRAMES=9 NUM_STEPS=3 python phase1_workers/run_e2e_sglang.py
 ```
+
+Output videos are saved to `/tmp/disagg_e2e/output_0.mp4`.
 
 ## Phases
 
@@ -73,6 +90,14 @@ python phase1_workers/run_e2e_sglang.py
 Single-GPU script proving diffusers supports split execution.
 
 ```bash
+# High quality
+python phase0_validate/validate_split.py \
+    --model hunyuanvideo-community/HunyuanVideo \
+    --prompt "A golden retriever running on a sunny beach" \
+    --num-steps 30 --num-frames 61 \
+    --output-dir /tmp/disagg_validate
+
+# Quick test
 python phase0_validate/validate_split.py \
     --model hunyuanvideo-community/HunyuanVideo \
     --prompt "A cat walking on grass" \
