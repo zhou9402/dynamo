@@ -151,16 +151,24 @@ class NixlSendStage(PipelineStage):
         self._output_fields = output_fields
         self._sender = None
 
+    @staticmethod
+    def _make_timings() -> object:
+        """Create a RequestTimings object compatible with sglang's executor."""
+        try:
+            from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import RequestTimings
+            return RequestTimings(request_id="nixl-send")
+        except Exception:
+            return None
+
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         tensors = self._extract_tensors(batch)
-        logging_info = batch.logging_info
         if not tensors:
-            return OutputBatch(output={}, logging_info=logging_info)
+            return OutputBatch(output={}, timings=self._make_timings())
 
         from nixl_transfer import NIXL_AVAILABLE
         if NIXL_AVAILABLE:
-            return self._nixl_send(tensors, logging_info)
-        return self._fallback_send(tensors, logging_info)
+            return self._nixl_send(tensors)
+        return self._fallback_send(tensors)
 
     def _extract_tensors(self, batch: Req) -> Dict[str, torch.Tensor]:
         """Flatten list-valued fields into individual tensors."""
@@ -182,14 +190,14 @@ class NixlSendStage(PipelineStage):
                 result[field] = val
         return result
 
-    def _nixl_send(self, tensors: Dict[str, torch.Tensor], logging_info) -> OutputBatch:
+    def _nixl_send(self, tensors: Dict[str, torch.Tensor]) -> OutputBatch:
         from nixl_transfer import NixlTensorSender
         if self._sender is None:
             self._sender = NixlTensorSender()
         meta = self._sender.send(tensors)
-        return OutputBatch(output={"_nixl_transfer_meta": meta}, logging_info=logging_info)
+        return OutputBatch(output={"_nixl_transfer_meta": meta}, timings=self._make_timings())
 
-    def _fallback_send(self, tensors: Dict[str, torch.Tensor], logging_info) -> OutputBatch:
+    def _fallback_send(self, tensors: Dict[str, torch.Tensor]) -> OutputBatch:
         """Fallback: send raw tensors via ZMQ pickle."""
         # Reconstruct list-valued fields for backward compat
         output: Dict[str, object] = {}
@@ -205,7 +213,7 @@ class NixlSendStage(PipelineStage):
                 real_key = base[6:]
                 output[real_key] = [idx_map[i] for i in sorted(idx_map)]
                 del output[base]
-        return OutputBatch(output=output, logging_info=logging_info)
+        return OutputBatch(output=output, timings=self._make_timings())
 
 
 # ═══════════════════════════════════════════════════════════════════════

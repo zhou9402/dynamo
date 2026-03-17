@@ -38,7 +38,7 @@ from typing import Dict
 
 import uvloop
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "phase1_workers"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workers"))
 
 from protocol import (  # noqa: E402
     DenoiserRequest, EncoderRequest, VAEDecodeRequest,
@@ -56,7 +56,7 @@ MAX_PIPELINE_DEPTH = int(os.environ.get("MAX_PIPELINE_DEPTH", "4"))
 
 async def call_stage(client, request_json: str) -> dict:
     result = None
-    stream = await client.generate(request_json)
+    stream = await client.round_robin(request_json)
     async for chunk in stream:
         data = chunk.data() if hasattr(chunk, "data") else chunk
         if isinstance(data, str):
@@ -155,16 +155,23 @@ async def worker(runtime: DistributedRuntime):
     await encoder_client.wait_for_instances()
     await denoiser_client.wait_for_instances()
     await vae_client.wait_for_instances()
-    logger.info("All 3 stage workers connected")
+
+    # Discover registered worker instances per stage
+    enc_ids = encoder_client.instance_ids()
+    den_ids = denoiser_client.instance_ids()
+    vae_ids = vae_client.instance_ids()
+    n_enc, n_den, n_vae = len(enc_ids) or 1, len(den_ids) or 1, len(vae_ids) or 1
+    logger.info("Workers: encoder=%d, denoiser=%d, vae=%d", n_enc, n_den, n_vae)
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     stage_sems = {
-        "encoder": asyncio.Semaphore(1),
-        "denoiser": asyncio.Semaphore(1),
-        "vae": asyncio.Semaphore(1),
+        "encoder": asyncio.Semaphore(n_enc),
+        "denoiser": asyncio.Semaphore(n_den),
+        "vae": asyncio.Semaphore(n_vae),
     }
-    admission = asyncio.Semaphore(MAX_PIPELINE_DEPTH)
+    pipeline_depth = MAX_PIPELINE_DEPTH if MAX_PIPELINE_DEPTH > 0 else (n_enc + n_den + n_vae)
+    admission = asyncio.Semaphore(pipeline_depth)
     tracker = PipelineTracker()
 
     async def run_stage(name: str, request_id: str, client, request_json: str) -> dict:
@@ -322,7 +329,7 @@ async def worker(runtime: DistributedRuntime):
             else:
                 raise
 
-    logger.info("Server listening on http://%s:%d (pipeline depth=%d)", HOST, bound_port, MAX_PIPELINE_DEPTH)
+    logger.info("Server listening on http://%s:%d (pipeline depth=%d)", HOST, bound_port, pipeline_depth)
     logger.info("  GET  /                        <- latest video preview")
     logger.info("  POST /v1/videos/generations")
     logger.info("  GET  /health")
