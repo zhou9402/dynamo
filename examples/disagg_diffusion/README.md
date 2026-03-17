@@ -73,12 +73,11 @@ Request 2:               [ Encoder ] ──► [ Denoiser ~~~~~~~~ ] ──► [
 Request 3:                            [ Encoder ] ──► [ Denoiser ~~~~~~~~ ]
 ```
 
-### Multi-Worker Stage Pools (Standalone E2E)
+### Multi-Worker Scaling
 
-The standalone E2E script (`phase1_workers/run_e2e_sglang.py`) supports
-**multiple workers per stage** to utilise all available GPUs.  Each stage
-runs an independent pool; the orchestrator round-robins requests across
-workers in each pool.
+Each stage supports **multiple workers** — just launch more processes with the
+same Dynamo component name.  They register via etcd and the orchestrator
+round-robins requests automatically.  Use `;` in GPU specs to separate workers:
 
 ```
           ┌─ Encoder_0 (GPU 0) ─┐    ┌─ Denoiser_0 TP=2 (GPU 1,2) ─┐    ┌─ VAE_0 (GPU 3) ─┐
@@ -87,20 +86,15 @@ workers in each pool.
             round-robin                  round-robin                        round-robin
 ```
 
-Use `;` to separate workers, `,` for TP GPUs within a worker:
-
 ```bash
-# 8 GPU — 2 workers per stage, single request
-GPU_ENC="0;4" GPU_DEN="1,2;5,6" GPU_VAE="3;7" python phase1_workers/run_e2e_sglang.py
+# 8 GPU — 2 workers per stage
+GPU_ENC="0;4" GPU_DEN="1,2;5,6" GPU_VAE="3;7" ./run_all.sh --test --quick
 
-# 8 GPU — benchmark with 50 requests, pipeline-parallel (CONCURRENCY≥3)
-GPU_ENC="0;4" GPU_DEN="1,2;5,6" GPU_VAE="3;7" \
-  NUM_REQUESTS=50 CONCURRENCY=4 NUM_FRAMES=9 NUM_STEPS=3 \
-  python phase1_workers/run_e2e_sglang.py
-
-# Asymmetric pools (1 encoder, 3 denoisers, 1 VAE)
-GPU_ENC="0" GPU_DEN="1,2;3,4;5,6" GPU_VAE="7" python phase1_workers/run_e2e_sglang.py
+# Asymmetric (1 encoder, 3 denoisers, 1 VAE)
+GPU_ENC="0" GPU_DEN="1,2;3,4;5,6" GPU_VAE="7" ./run_all.sh
 ```
+
+Single-worker specs (no `;`) are fully backward compatible.
 
 No pre-pairing is needed — each `send()` allocates a new NIXL buffer and
 the `_keep_alive` coroutine holds it until the receiver's RDMA pull completes,
@@ -131,12 +125,12 @@ Or launch each service manually:
 etcd --data-dir /tmp/etcd_disagg --listen-client-urls http://0.0.0.0:2379
 
 # Terminal 1-3: Workers
-CUDA_VISIBLE_DEVICES=0   python phase1_workers/encoder_worker.py
-CUDA_VISIBLE_DEVICES=1,2 python phase1_workers/denoiser_worker.py
-CUDA_VISIBLE_DEVICES=3   python phase1_workers/vae_worker.py
+CUDA_VISIBLE_DEVICES=0   python workers/encoder_worker.py
+CUDA_VISIBLE_DEVICES=1,2 python workers/denoiser_worker.py
+CUDA_VISIBLE_DEVICES=3   python workers/vae_worker.py
 
 # Terminal 4: Orchestrator
-python phase2_orchestrator/run_disagg.py
+python orchestrator/run_disagg.py
 ```
 
 Generate a video (61 frames, 50 steps, 544x960 by default):
@@ -160,7 +154,7 @@ curl -X POST http://localhost:8080/v1/videos/generations \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MODEL_PATH` | `hunyuanvideo-community/HunyuanVideo` | HuggingFace model ID or local path |
-| `GPU_ENC` / `GPU_DEN` / `GPU_VAE` | `0` / `1,2` / `3` | GPU assignment per stage (use `;` for multi-worker pools, e.g. `"0;4"`) |
+| `GPU_ENC` / `GPU_DEN` / `GPU_VAE` | `0` / `1,2` / `3` | GPU assignment per stage (use `;` to launch multiple workers, e.g. `"0;4"`) |
 | `TP_SIZE` | auto from `GPU_DEN` | Tensor parallelism for denoiser |
 | `PORT` | `8080` | Orchestrator HTTP port |
 | `OUTPUT_DIR` | `/tmp/disagg_videos` | Video output directory |
@@ -172,7 +166,7 @@ curl -X POST http://localhost:8080/v1/videos/generations \
 
 ## Roadmap
 
-- [x] **Multi-worker stage pools** — configurable N workers per stage with round-robin dispatch (standalone E2E)
+- [x] **Multi-worker scaling** — launch N workers per stage via `run_all.sh`; Dynamo auto-discovers and round-robins
 - [ ] **Dynamic scaling** — auto-scale workers based on queue depth, add/remove denoiser replicas
 - [ ] **Streaming output** — stream decoded frames to client as they are produced
 - [ ] **Orchestrator improvements** — smarter scheduling, request priority, load balancing across replicas

@@ -57,8 +57,8 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req, OutputBatch
-from sglang.multimodal_gen.runtime.pipelines.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req, OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 # layerwise_offload may not exist in all sglang versions — guard import
@@ -219,7 +219,7 @@ def build_encoder_stages(pipeline, server_args):
     Automatically detects all loaded text encoders/tokenizers so that
     both single-encoder (Wan) and dual-encoder (HunyuanVideo) models work.
     """
-    from sglang.multimodal_gen.runtime.pipelines.stages.text_encoding import (
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
         TextEncodingStage,
     )
     from sglang_utils import get_component_backend
@@ -252,13 +252,13 @@ def build_encoder_stages(pipeline, server_args):
 
 def build_denoiser_stages(pipeline, server_args):
     """NixlReceive → LatentPrep → TimestepPrep → Denoising → NixlSend."""
-    from sglang.multimodal_gen.runtime.pipelines.stages.latent_preparation import (
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
         LatentPreparationStage,
     )
-    from sglang.multimodal_gen.runtime.pipelines.stages.timestep_preparation import (
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation import (
         TimestepPreparationStage,
     )
-    from sglang.multimodal_gen.runtime.pipelines.stages.denoising import (
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
         DenoisingStage,
     )
     from sglang_utils import get_component_backend
@@ -278,7 +278,7 @@ def build_denoiser_stages(pipeline, server_args):
 
 def build_vae_stages(pipeline, server_args):
     """NixlReceive → DecodingStage."""
-    from sglang.multimodal_gen.runtime.pipelines.stages.decoding import (
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
         DecodingStage,
     )
     from sglang_utils import get_component_backend

@@ -2,26 +2,33 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Launch all disaggregated diffusion services (etcd + 3 workers + orchestrator)
+# Launch all disaggregated diffusion services (etcd + workers + orchestrator)
 # and optionally send a test request.
 #
+# Each stage supports multiple workers: use ';' to separate workers in GPU
+# specs.  Each worker is an independent top-level process; Dynamo discovers
+# them via etcd and the orchestrator round-robins requests automatically.
+#
 # Usage:
-#   ./run_all.sh                    # launch all services
+#   ./run_all.sh                    # launch all services (1 worker/stage)
 #   ./run_all.sh --test             # launch + send a test request
 #   ./run_all.sh --test --quick     # launch + quick smoke test (9 frames, 3 steps)
 #
+#   # Multi-worker (8 GPU):
+#   GPU_ENC="0;4" GPU_DEN="1,2;5,6" GPU_VAE="3;7" ./run_all.sh --test --quick
+#
 # Environment variables:
 #   MODEL_PATH    HuggingFace model (default: hunyuanvideo-community/HunyuanVideo)
-#   GPU_ENC       GPU for encoder (default: 0)
-#   GPU_DEN       GPUs for denoiser (default: 1,2)
-#   GPU_VAE       GPU for VAE (default: 3)
+#   GPU_ENC       GPU(s) for encoder  (default: 0; use "0;4" for 2 workers)
+#   GPU_DEN       GPU(s) for denoiser (default: 1,2; use "1,2;5,6" for 2 TP=2 workers)
+#   GPU_VAE       GPU(s) for VAE      (default: 3; use "3;7" for 2 workers)
 #   PORT          HTTP port (default: 8080)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKERS_DIR="$SCRIPT_DIR/phase1_workers"
-ORCH_DIR="$SCRIPT_DIR/phase2_orchestrator"
+WORKERS_DIR="$SCRIPT_DIR/workers"
+ORCH_DIR="$SCRIPT_DIR/orchestrator"
 LOG_DIR="/tmp/disagg_logs"
 
 GPU_ENC="${GPU_ENC:-0}"
@@ -79,35 +86,55 @@ else
     echo "[1/5] etcd already running, skipping."
 fi
 
-# 2. Encoder Worker
-echo "[2/5] Starting Encoder Worker (GPU $GPU_ENC)..."
-CUDA_VISIBLE_DEVICES="$GPU_ENC" python "$WORKERS_DIR/encoder_worker.py" \
-    > "$LOG_DIR/encoder.log" 2>&1 &
-PIDS+=($!)
+# 2. Encoder Worker(s)
+STEP=2
+IFS=';' read -ra ENC_GPUS <<< "$GPU_ENC"
+for i in "${!ENC_GPUS[@]}"; do
+    port=$((15600 + i * 10))
+    echo "[$STEP] Starting Encoder Worker $i (GPU ${ENC_GPUS[$i]}, port $port)..."
+    CUDA_VISIBLE_DEVICES="${ENC_GPUS[$i]}" SCHEDULER_PORT=$port \
+        python "$WORKERS_DIR/encoder_worker.py" > "$LOG_DIR/encoder_$i.log" 2>&1 &
+    PIDS+=($!)
+    STEP=$((STEP + 1))
+done
 
-# 3. Denoiser Worker
-echo "[3/5] Starting Denoiser Worker (GPU $GPU_DEN)..."
-CUDA_VISIBLE_DEVICES="$GPU_DEN" python "$WORKERS_DIR/denoiser_worker.py" \
-    > "$LOG_DIR/denoiser.log" 2>&1 &
-PIDS+=($!)
+# 3. Denoiser Worker(s)
+IFS=';' read -ra DEN_GPUS <<< "$GPU_DEN"
+for i in "${!DEN_GPUS[@]}"; do
+    port=$((15700 + i * 10))
+    echo "[$STEP] Starting Denoiser Worker $i (GPU ${DEN_GPUS[$i]}, port $port)..."
+    CUDA_VISIBLE_DEVICES="${DEN_GPUS[$i]}" SCHEDULER_PORT=$port \
+        python "$WORKERS_DIR/denoiser_worker.py" > "$LOG_DIR/denoiser_$i.log" 2>&1 &
+    PIDS+=($!)
+    STEP=$((STEP + 1))
+done
 
-# 4. VAE Worker
-echo "[4/5] Starting VAE Worker (GPU $GPU_VAE)..."
-CUDA_VISIBLE_DEVICES="$GPU_VAE" python "$WORKERS_DIR/vae_worker.py" \
-    > "$LOG_DIR/vae.log" 2>&1 &
-PIDS+=($!)
+# 4. VAE Worker(s)
+IFS=';' read -ra VAE_GPUS <<< "$GPU_VAE"
+for i in "${!VAE_GPUS[@]}"; do
+    port=$((15800 + i * 10))
+    echo "[$STEP] Starting VAE Worker $i (GPU ${VAE_GPUS[$i]}, port $port)..."
+    CUDA_VISIBLE_DEVICES="${VAE_GPUS[$i]}" SCHEDULER_PORT=$port \
+        python "$WORKERS_DIR/vae_worker.py" > "$LOG_DIR/vae_$i.log" 2>&1 &
+    PIDS+=($!)
+    STEP=$((STEP + 1))
+done
+
+N_WORKERS=$(( ${#ENC_GPUS[@]} + ${#DEN_GPUS[@]} + ${#VAE_GPUS[@]} ))
+echo ""
+echo "Launched $N_WORKERS worker(s): ${#ENC_GPUS[@]} encoder, ${#DEN_GPUS[@]} denoiser, ${#VAE_GPUS[@]} vae"
 
 # 5. Orchestrator
-echo "[5/5] Starting Orchestrator (port $PORT)..."
+echo "[$STEP] Starting Orchestrator (port $PORT)..."
 PORT="$PORT" python "$ORCH_DIR/run_disagg.py" \
     > "$LOG_DIR/orchestrator.log" 2>&1 &
 PIDS+=($!)
 
 echo ""
 echo "All services launching. Waiting for workers to be ready..."
-echo "  tail -f $LOG_DIR/encoder.log    # monitor encoder"
-echo "  tail -f $LOG_DIR/denoiser.log   # monitor denoiser"
-echo "  tail -f $LOG_DIR/vae.log        # monitor vae"
+echo "  tail -f $LOG_DIR/encoder_*.log   # monitor encoder(s)"
+echo "  tail -f $LOG_DIR/denoiser_*.log  # monitor denoiser(s)"
+echo "  tail -f $LOG_DIR/vae_*.log       # monitor vae(s)"
 echo "  tail -f $LOG_DIR/orchestrator.log"
 echo ""
 

@@ -8,7 +8,7 @@ needs), launch stage servers, and convert between Dynamo protocol types
 and SGLang's Req dataclass.
 
 Also contains shared utilities (StageClient, model detection, compatibility
-patches) used by both Dynamo workers and the standalone E2E script.
+patches) used by Dynamo workers.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def build_partial_pipeline(
     Auto-detects pipeline class from model_index.json, suppresses automatic
     stage creation, and syncs all component configs (even unloaded ones).
     """
-    from sglang.multimodal_gen.runtime.pipelines import get_model_info
+    from sglang.multimodal_gen.runtime.pipelines_core import get_model_info
 
     model_info = get_model_info(server_args.model_path)
     base_pipeline_cls = model_info.pipeline_cls
@@ -46,7 +46,7 @@ def build_partial_pipeline(
     def _safe_init(self, **kwargs):
         # Call ComposedPipelineBase.__init__ directly, skipping LoRAPipeline
         # which tries to access self.modules['transformer']
-        from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
+        from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
             ComposedPipelineBase,
         )
         ComposedPipelineBase.__init__(self, **kwargs)
@@ -155,8 +155,8 @@ def build_req(
     **extra_fields,
 ) -> "Req":
     """Construct a minimal SGLang ``Req`` for running pipeline stages."""
-    from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
-    from sglang.multimodal_gen.configs.sample.base import DataType
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+    from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 
     req = Req(
         data_type=DataType.VIDEO,
@@ -238,49 +238,14 @@ class StageClient:
         self._ctx.term()
 
 
-class StageWorkerPool:
-    """Pool of StageClients for one stage with round-robin dispatch.
-
-    A per-pool asyncio.Lock serialises access so that at most one request
-    is processed per stage at a time.  This avoids concurrent NIXL RDMA
-    operations within the same stage (which trigger UCX race conditions)
-    while still allowing **pipeline parallelism** across stages — i.e.
-    Encoder, Denoiser, and VAE can each be active simultaneously on
-    different requests.
-
-    Set ``CONCURRENCY >= 3`` to keep the 3-stage pipeline fully saturated.
-    """
-
-    def __init__(self, clients: List[StageClient], name: str = ""):
-        self._clients = clients
-        self._name = name
-        self._counter = 0
-        self._lock = asyncio.Lock()
-
-    @property
-    def num_workers(self) -> int:
-        return len(self._clients)
-
-    async def forward(self, reqs):
-        """Round-robin dispatch to next available worker (serialised)."""
-        async with self._lock:
-            idx = self._counter % len(self._clients)
-            self._counter += 1
-            return await self._clients[idx].forward(reqs)
-
-    def close(self):
-        for c in self._clients:
-            c.close()
-
-
 def patch_hunyuan_config():
     """HunyuanConfig inherits ``task_type`` from PipelineConfig without a
     default value, so ``HunyuanConfig()`` crashes.  Wrap __init__ to supply
     ``task_type=T2V`` when omitted.  Idempotent.
     """
-    from sglang.multimodal_gen.configs.pipelines.base import ModelTaskType
+    from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
     try:
-        from sglang.multimodal_gen.configs.pipelines.hunyuan import (
+        from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
             HunyuanConfig, FastHunyuanConfig,
         )
     except ImportError:
@@ -388,5 +353,8 @@ def launch_stage_server(model_path, required_modules, custom_stages_fn,
         custom_stages_fn=custom_stages_fn,
     )
 
-    client = StageClient(server_args.scheduler_endpoint(), client_name)
+    endpoint = server_args.scheduler_endpoint
+    if callable(endpoint):
+        endpoint = endpoint()
+    client = StageClient(endpoint, client_name)
     return processes, client, server_args
