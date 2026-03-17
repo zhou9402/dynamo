@@ -45,32 +45,16 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/disagg_videos")
 
 @dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
-    from sglang_utils import StageClient, patch_hunyuan_config, build_req, save_video
-    from partial_gpu_worker import build_vae_stages, launch_partial_server
-    from sglang.multimodal_gen.runtime.server_args import (
-        ServerArgs, set_global_server_args,
-    )
+    from sglang_utils import launch_stage_server, build_req, save_video
+    from partial_gpu_worker import build_vae_stages
 
-    patch_hunyuan_config()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    server_args = ServerArgs.from_kwargs(
-        model_path=MODEL_PATH,
-        num_gpus=1,
-        tp_size=1,
-        scheduler_port=SCHEDULER_PORT,
-    )
-    set_global_server_args(server_args)
-
     logger.info("Launching VAE Scheduler: port=%d", SCHEDULER_PORT)
-    processes = launch_partial_server(
-        server_args,
-        required_modules=["vae", "scheduler"],
-        custom_stages_fn=build_vae_stages,
+    processes, client, server_args = launch_stage_server(
+        MODEL_PATH, ["vae", "scheduler"], build_vae_stages,
+        SCHEDULER_PORT, client_name="vae",
     )
-
-    # Connect ZMQ client to local Scheduler
-    client = StageClient(server_args.scheduler_endpoint, "vae")
 
     # ── Dynamo RPC handlers ──────────────────────────────────────────
 

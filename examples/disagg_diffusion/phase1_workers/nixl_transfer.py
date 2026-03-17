@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Dict
 
 import torch
 
@@ -61,7 +61,7 @@ class NixlTensorSender:
 
     def send(self, tensors: Dict[str, torch.Tensor]) -> dict:
         """Register tensors and return metadata dict (synchronous wrapper)."""
-        return asyncio.run(self._async_send(tensors))
+        return asyncio.get_event_loop().run_until_complete(self._async_send(tensors))
 
     async def _async_send(self, tensors: Dict[str, torch.Tensor]) -> dict:
         # Clean completed tasks
@@ -99,7 +99,7 @@ class NixlTensorReceiver:
 
     def recv(self, meta: dict, device: str = "cuda") -> Dict[str, torch.Tensor]:
         """Pull tensors described by metadata. Returns {name: tensor}."""
-        return asyncio.run(self._async_recv(meta, device))
+        return asyncio.get_event_loop().run_until_complete(self._async_recv(meta, device))
 
     async def _async_recv(self, meta: dict, device: str) -> Dict[str, torch.Tensor]:
         connector = await _PersistentConnector.get()

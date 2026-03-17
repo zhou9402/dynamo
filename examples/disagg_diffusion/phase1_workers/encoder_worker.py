@@ -44,38 +44,15 @@ SCHEDULER_PORT = int(os.environ.get("SCHEDULER_PORT", "15600"))
 
 @dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
-    from sglang_utils import (
-        StageClient, patch_hunyuan_config, detect_encoder_modules, build_req,
-    )
-    from partial_gpu_worker import build_encoder_stages, launch_partial_server
-    from sglang.multimodal_gen.runtime.server_args import (
-        ServerArgs, set_global_server_args,
-    )
+    from sglang_utils import launch_stage_server, detect_encoder_modules, build_req
+    from partial_gpu_worker import build_encoder_stages
 
-    patch_hunyuan_config()
-
-    # Launch SGLang Scheduler subprocess with text encoder stages
     enc_modules = detect_encoder_modules(MODEL_PATH)
-    server_args = ServerArgs.from_kwargs(
-        model_path=MODEL_PATH,
-        num_gpus=1,
-        tp_size=1,
-        scheduler_port=SCHEDULER_PORT,
+    logger.info("Launching encoder Scheduler: modules=%s, port=%d", enc_modules, SCHEDULER_PORT)
+    processes, client, server_args = launch_stage_server(
+        MODEL_PATH, enc_modules, build_encoder_stages,
+        SCHEDULER_PORT, client_name="encoder",
     )
-    set_global_server_args(server_args)
-
-    logger.info(
-        "Launching encoder Scheduler: modules=%s, port=%d",
-        enc_modules, SCHEDULER_PORT,
-    )
-    processes = launch_partial_server(
-        server_args,
-        required_modules=enc_modules,
-        custom_stages_fn=build_encoder_stages,
-    )
-
-    # Connect ZMQ client to local Scheduler
-    client = StageClient(server_args.scheduler_endpoint, "encoder")
 
     # ── Dynamo RPC handlers ──────────────────────────────────────────
 

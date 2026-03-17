@@ -3,9 +3,9 @@
 
 """SGLang PipelineStage utilities for disaggregated diffusion workers.
 
-Provides helpers to construct ServerArgs, load partial pipelines (only the
-modules each worker needs), and convert between Dynamo protocol types and
-SGLang's Req dataclass.
+Provides helpers to load partial pipelines (only the modules each worker
+needs), launch stage servers, and convert between Dynamo protocol types
+and SGLang's Req dataclass.
 
 Also contains shared utilities (StageClient, model detection, compatibility
 patches) used by both Dynamo workers and the standalone E2E script.
@@ -16,64 +16,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
 logger = logging.getLogger(__name__)
-
-
-def build_server_args(model_path: str, **overrides):
-    """Create a ServerArgs, initialize torch.distributed, and set the global singleton."""
-    from sglang.multimodal_gen.runtime.server_args import (
-        ServerArgs,
-        set_global_server_args,
-    )
-
-    defaults = dict(
-        model_path=model_path,
-        num_gpus=1,
-    )
-    defaults.update(overrides)
-    server_args = ServerArgs.from_kwargs(**defaults)
-    set_global_server_args(server_args)
-
-    _ensure_distributed_init(server_args)
-
-    return server_args
-
-
-def _ensure_distributed_init(server_args):
-    """Initialize torch.distributed and model-parallel groups via SGLang."""
-    import inspect
-    from sglang.multimodal_gen.runtime.distributed import (
-        model_parallel_is_initialized,
-        maybe_init_distributed_environment_and_model_parallel,
-    )
-
-    if model_parallel_is_initialized():
-        return
-
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", str(server_args.master_port))
-    os.environ.setdefault("LOCAL_RANK", "0")
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", "1")
-
-    kwargs = dict(
-        tp_size=server_args.tp_size,
-        enable_cfg_parallel=server_args.enable_cfg_parallel,
-        ulysses_degree=server_args.ulysses_degree,
-        ring_degree=server_args.ring_degree,
-        sp_size=server_args.sp_degree,
-        dp_size=server_args.dp_size,
-        distributed_init_method=f"tcp://127.0.0.1:{server_args.master_port}",
-    )
-    sig = inspect.signature(maybe_init_distributed_environment_and_model_parallel)
-    if "dist_timeout" in sig.parameters:
-        kwargs["dist_timeout"] = server_args.dist_timeout
-
-    maybe_init_distributed_environment_and_model_parallel(**kwargs)
 
 
 def build_partial_pipeline(
@@ -85,7 +32,7 @@ def build_partial_pipeline(
     Auto-detects pipeline class from model_index.json, suppresses automatic
     stage creation, and syncs all component configs (even unloaded ones).
     """
-    from sglang.multimodal_gen.runtime.pipelines_core import get_model_info
+    from sglang.multimodal_gen.runtime.pipelines import get_model_info
 
     model_info = get_model_info(server_args.model_path)
     base_pipeline_cls = model_info.pipeline_cls
@@ -99,7 +46,7 @@ def build_partial_pipeline(
     def _safe_init(self, **kwargs):
         # Call ComposedPipelineBase.__init__ directly, skipping LoRAPipeline
         # which tries to access self.modules['transformer']
-        from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
+        from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
             ComposedPipelineBase,
         )
         ComposedPipelineBase.__init__(self, **kwargs)
@@ -208,9 +155,11 @@ def build_req(
     **extra_fields,
 ) -> "Req":
     """Construct a minimal SGLang ``Req`` for running pipeline stages."""
-    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+    from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
+    from sglang.multimodal_gen.configs.sample.base import DataType
 
     req = Req(
+        data_type=DataType.VIDEO,
         prompt=prompt,
         negative_prompt=negative_prompt,
         height=height,
@@ -227,34 +176,6 @@ def build_req(
         setattr(req, k, v)
 
     return req
-
-
-def extract_tensors_from_req(
-    req,
-    keys: List[str],
-) -> Dict[str, object]:
-    """Pull named tensor fields out of a ``Req`` for NIXL transfer.
-
-    Single-element lists are unwrapped to bare tensors.
-    Multi-element lists (dual-encoder outputs) are preserved as lists.
-    """
-    result: Dict[str, object] = {}
-    for key in keys:
-        val = getattr(req, key, None)
-        if val is None:
-            continue
-        if isinstance(val, list):
-            if len(val) == 0:
-                continue
-            if len(val) == 1:
-                result[key] = val[0]
-            else:
-                # Keep multi-element lists intact (e.g. dual-encoder outputs
-                # with incompatible shapes)
-                result[key] = val
-        elif isinstance(val, torch.Tensor):
-            result[key] = val
-    return result
 
 
 def inject_tensors_to_req(
@@ -322,9 +243,9 @@ def patch_hunyuan_config():
     default value, so ``HunyuanConfig()`` crashes.  Wrap __init__ to supply
     ``task_type=T2V`` when omitted.  Idempotent.
     """
-    from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+    from sglang.multimodal_gen.configs.pipelines.base import ModelTaskType
     try:
-        from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
+        from sglang.multimodal_gen.configs.pipelines.hunyuan import (
             HunyuanConfig, FastHunyuanConfig,
         )
     except ImportError:
@@ -398,3 +319,39 @@ def save_video(frames_tensor, output_path: str, fps: int = 24):
         Image.fromarray(frames[0]).save(output_path)
 
     return output_path, len(frames)
+
+
+def launch_stage_server(model_path, required_modules, custom_stages_fn,
+                        scheduler_port, tp_size=1, num_gpus=None,
+                        client_name=""):
+    """Patch configs, create ServerArgs, launch Scheduler, return (processes, client, server_args).
+
+    Consolidates the boilerplate shared by encoder, denoiser, and VAE workers:
+    patch_hunyuan_config → ServerArgs → set_global → launch_partial_server → StageClient.
+    """
+    from sglang.multimodal_gen.runtime.server_args import (
+        ServerArgs, set_global_server_args,
+    )
+    from partial_gpu_worker import launch_partial_server
+
+    patch_hunyuan_config()
+
+    if num_gpus is None:
+        num_gpus = tp_size
+
+    server_args = ServerArgs.from_kwargs(
+        model_path=model_path,
+        num_gpus=num_gpus,
+        tp_size=tp_size,
+        scheduler_port=scheduler_port,
+    )
+    set_global_server_args(server_args)
+
+    processes = launch_partial_server(
+        server_args,
+        required_modules=required_modules,
+        custom_stages_fn=custom_stages_fn,
+    )
+
+    client = StageClient(server_args.scheduler_endpoint(), client_name)
+    return processes, client, server_args

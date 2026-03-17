@@ -85,10 +85,6 @@ from sglang_utils import (  # noqa: E402
     save_video,
 )
 
-# Backward-compat aliases for any external code that imports old names
-_patch_hunyuan_config_task_type = patch_hunyuan_config
-_detect_encoder_modules = detect_encoder_modules
-
 
 # ── Stage launchers ─────────────────────────────────────────────────────
 
@@ -330,9 +326,9 @@ async def main():
         logger.info("All stages launched in %.1fs", time.monotonic() - t_launch)
 
         # ── Connect clients ──────────────────────────────────────────
-        enc_client = StageClient(enc_args.scheduler_endpoint, "encoder")
-        den_client = StageClient(den_args.scheduler_endpoint, "denoiser")
-        vae_client = StageClient(vae_args.scheduler_endpoint, "vae")
+        enc_client = StageClient(enc_args.scheduler_endpoint(), "encoder")
+        den_client = StageClient(den_args.scheduler_endpoint(), "denoiser")
+        vae_client = StageClient(vae_args.scheduler_endpoint(), "vae")
 
         # ── Warmup ───────────────────────────────────────────────────
         logger.info("Warmup request …")

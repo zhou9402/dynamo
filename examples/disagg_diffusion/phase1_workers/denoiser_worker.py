@@ -46,38 +46,19 @@ SCHEDULER_PORT = int(os.environ.get("SCHEDULER_PORT", "15700"))
 
 @dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
-    from sglang_utils import StageClient, patch_hunyuan_config, build_req
-    from partial_gpu_worker import build_denoiser_stages, launch_partial_server
-    from sglang.multimodal_gen.runtime.server_args import (
-        ServerArgs, set_global_server_args,
-    )
-
-    patch_hunyuan_config()
+    from sglang_utils import launch_stage_server, build_req
+    from partial_gpu_worker import build_denoiser_stages
 
     # Auto-detect GPU count from CUDA_VISIBLE_DEVICES
     num_gpus = len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))
     tp_size = int(os.environ.get("TP_SIZE", str(num_gpus)))
 
-    server_args = ServerArgs.from_kwargs(
-        model_path=MODEL_PATH,
-        num_gpus=num_gpus,
-        tp_size=tp_size,
-        scheduler_port=SCHEDULER_PORT,
+    logger.info("Launching denoiser Scheduler: num_gpus=%d, tp=%d, port=%d", num_gpus, tp_size, SCHEDULER_PORT)
+    processes, client, server_args = launch_stage_server(
+        MODEL_PATH, ["transformer", "scheduler"], build_denoiser_stages,
+        SCHEDULER_PORT, tp_size=tp_size, num_gpus=num_gpus,
+        client_name="denoiser",
     )
-    set_global_server_args(server_args)
-
-    logger.info(
-        "Launching denoiser Scheduler: num_gpus=%d, tp=%d, port=%d",
-        num_gpus, tp_size, SCHEDULER_PORT,
-    )
-    processes = launch_partial_server(
-        server_args,
-        required_modules=["transformer", "scheduler"],
-        custom_stages_fn=build_denoiser_stages,
-    )
-
-    # Connect ZMQ client to local Scheduler
-    client = StageClient(server_args.scheduler_endpoint, "denoiser")
 
     # ── Dynamo RPC handlers ──────────────────────────────────────────
 

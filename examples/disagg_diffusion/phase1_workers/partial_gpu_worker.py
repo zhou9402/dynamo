@@ -57,8 +57,8 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req, OutputBatch
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req, OutputBatch
+from sglang.multimodal_gen.runtime.pipelines.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 # layerwise_offload may not exist in all sglang versions — guard import
@@ -102,12 +102,10 @@ class NixlReceiveStage(PipelineStage):
             self._receiver = NixlTensorReceiver()
         tensors = self._receiver.recv(meta, device="cuda")
         # Reconstruct indexed fields (e.g. prompt_embeds_0, prompt_embeds_1
-        # + __prompt_embeds_count → prompt_embeds list)
+        # → prompt_embeds list)
         reconstructed = {}
         indexed = {}  # base_name → {idx: tensor}
         for k, v in tensors.items():
-            if k.startswith("__") and k.endswith("_count"):
-                continue
             parts = k.rsplit("_", 1)
             if len(parts) == 2 and parts[1].isdigit():
                 indexed.setdefault(parts[0], {})[int(parts[1])] = v
@@ -153,24 +151,16 @@ class NixlSendStage(PipelineStage):
         self._output_fields = output_fields
         self._sender = None
 
-    @staticmethod
-    def _make_timings():
-        """Create a RequestTimings so gpu_worker.execute_forward doesn't crash."""
-        try:
-            from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
-            return RequestTimings(request_id="nixl")
-        except Exception:
-            return None
-
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         tensors = self._extract_tensors(batch)
+        logging_info = batch.logging_info
         if not tensors:
-            return OutputBatch(output={}, timings=self._make_timings())
+            return OutputBatch(output={}, logging_info=logging_info)
 
         from nixl_transfer import NIXL_AVAILABLE
         if NIXL_AVAILABLE:
-            return self._nixl_send(tensors)
-        return self._fallback_send(tensors)
+            return self._nixl_send(tensors, logging_info)
+        return self._fallback_send(tensors, logging_info)
 
     def _extract_tensors(self, batch: Req) -> Dict[str, torch.Tensor]:
         """Flatten list-valued fields into individual tensors."""
@@ -188,35 +178,23 @@ class NixlSendStage(PipelineStage):
                     # Dual-encoder: store each element separately for NIXL
                     for i, t in enumerate(val):
                         result[f"{field}_{i}"] = t
-                    result[f"__{field}_count"] = torch.tensor(len(val))
             elif isinstance(val, torch.Tensor):
                 result[field] = val
         return result
 
-    def _nixl_send(self, tensors: Dict[str, torch.Tensor]) -> OutputBatch:
+    def _nixl_send(self, tensors: Dict[str, torch.Tensor], logging_info) -> OutputBatch:
         from nixl_transfer import NixlTensorSender
         if self._sender is None:
             self._sender = NixlTensorSender()
-        # Filter out non-GPU metadata tensors for NIXL
-        gpu_tensors = {k: v for k, v in tensors.items()
-                       if isinstance(v, torch.Tensor) and v.is_cuda}
-        cpu_tensors = {k: v for k, v in tensors.items()
-                       if isinstance(v, torch.Tensor) and not v.is_cuda}
-        meta = self._sender.send(gpu_tensors)
-        # Include CPU metadata tensors directly (e.g. __count fields)
-        meta["cpu_tensors"] = cpu_tensors
-        return OutputBatch(output={"_nixl_transfer_meta": meta}, timings=self._make_timings())
+        meta = self._sender.send(tensors)
+        return OutputBatch(output={"_nixl_transfer_meta": meta}, logging_info=logging_info)
 
-    def _fallback_send(self, tensors: Dict[str, torch.Tensor]) -> OutputBatch:
+    def _fallback_send(self, tensors: Dict[str, torch.Tensor], logging_info) -> OutputBatch:
         """Fallback: send raw tensors via ZMQ pickle."""
         # Reconstruct list-valued fields for backward compat
         output: Dict[str, object] = {}
-        counts = {}
         for k, v in tensors.items():
-            if k.startswith("__") and k.endswith("_count"):
-                base = k[2:-6]
-                counts[base] = int(v.item())
-            elif "_" in k and k.rsplit("_", 1)[1].isdigit():
+            if "_" in k and k.rsplit("_", 1)[1].isdigit():
                 base, idx = k.rsplit("_", 1)
                 output.setdefault(f"_list_{base}", {})[int(idx)] = v
             else:
@@ -227,7 +205,7 @@ class NixlSendStage(PipelineStage):
                 real_key = base[6:]
                 output[real_key] = [idx_map[i] for i in sorted(idx_map)]
                 del output[base]
-        return OutputBatch(output=output, timings=self._make_timings())
+        return OutputBatch(output=output, logging_info=logging_info)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -241,7 +219,7 @@ def build_encoder_stages(pipeline, server_args):
     Automatically detects all loaded text encoders/tokenizers so that
     both single-encoder (Wan) and dual-encoder (HunyuanVideo) models work.
     """
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    from sglang.multimodal_gen.runtime.pipelines.stages.text_encoding import (
         TextEncodingStage,
     )
     from sglang_utils import get_component_backend
@@ -274,13 +252,13 @@ def build_encoder_stages(pipeline, server_args):
 
 def build_denoiser_stages(pipeline, server_args):
     """NixlReceive → LatentPrep → TimestepPrep → Denoising → NixlSend."""
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
+    from sglang.multimodal_gen.runtime.pipelines.stages.latent_preparation import (
         LatentPreparationStage,
     )
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation import (
+    from sglang.multimodal_gen.runtime.pipelines.stages.timestep_preparation import (
         TimestepPreparationStage,
     )
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    from sglang.multimodal_gen.runtime.pipelines.stages.denoising import (
         DenoisingStage,
     )
     from sglang_utils import get_component_backend
@@ -300,7 +278,7 @@ def build_denoiser_stages(pipeline, server_args):
 
 def build_vae_stages(pipeline, server_args):
     """NixlReceive → DecodingStage."""
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    from sglang.multimodal_gen.runtime.pipelines.stages.decoding import (
         DecodingStage,
     )
     from sglang_utils import get_component_backend
