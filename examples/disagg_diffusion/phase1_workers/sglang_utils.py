@@ -239,22 +239,34 @@ class StageClient:
 
 
 class StageWorkerPool:
-    """Pool of StageClients for one stage with round-robin dispatch."""
+    """Pool of StageClients for one stage with round-robin dispatch.
+
+    A per-pool asyncio.Lock serialises access so that at most one request
+    is processed per stage at a time.  This avoids concurrent NIXL RDMA
+    operations within the same stage (which trigger UCX race conditions)
+    while still allowing **pipeline parallelism** across stages — i.e.
+    Encoder, Denoiser, and VAE can each be active simultaneously on
+    different requests.
+
+    Set ``CONCURRENCY >= 3`` to keep the 3-stage pipeline fully saturated.
+    """
 
     def __init__(self, clients: List[StageClient], name: str = ""):
         self._clients = clients
         self._name = name
         self._counter = 0
+        self._lock = asyncio.Lock()
 
     @property
     def num_workers(self) -> int:
         return len(self._clients)
 
     async def forward(self, reqs):
-        """Round-robin dispatch to next available worker."""
-        idx = self._counter % len(self._clients)
-        self._counter += 1
-        return await self._clients[idx].forward(reqs)
+        """Round-robin dispatch to next available worker (serialised)."""
+        async with self._lock:
+            idx = self._counter % len(self._clients)
+            self._counter += 1
+            return await self._clients[idx].forward(reqs)
 
     def close(self):
         for c in self._clients:

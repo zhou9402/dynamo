@@ -390,15 +390,25 @@ async def main():
         logger.info("All stages launched in %.1fs", time.monotonic() - t_launch)
 
         # ── Warmup ───────────────────────────────────────────────────
-        logger.info("Warmup request …")
-        warmup = await run_single_pipeline(
-            -1, enc_pool, den_pool, vae_pool, SEED, save_output=False,
+        # Send one warmup request per worker (round-robin) so every
+        # worker's NIXL connector + UCX transport is fully initialised
+        # before concurrent requests hit them.
+        num_warmup = max(
+            enc_pool.num_workers, den_pool.num_workers, vae_pool.num_workers,
         )
-        logger.info(
-            "Warmup done — enc=%.2fs den=%.2fs vae=%.2fs total=%.2fs",
-            warmup["encoder_s"], warmup["denoiser_s"],
-            warmup["vae_s"], warmup["total_s"],
-        )
+        logger.info("Warmup: %d sequential request(s) …", num_warmup)
+        for wi in range(num_warmup):
+            warmup = await run_single_pipeline(
+                -(wi + 1), enc_pool, den_pool, vae_pool, SEED,
+                save_output=False,
+            )
+            logger.info(
+                "  warmup %d/%d — enc=%.2fs den=%.2fs vae=%.2fs total=%.2fs",
+                wi + 1, num_warmup,
+                warmup["encoder_s"], warmup["denoiser_s"],
+                warmup["vae_s"], warmup["total_s"],
+            )
+        logger.info("Warmup done")
 
         # ── Run pipeline(s) ──────────────────────────────────────────
         if NUM_REQUESTS <= 1:
