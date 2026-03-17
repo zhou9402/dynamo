@@ -238,6 +238,29 @@ class StageClient:
         self._ctx.term()
 
 
+class StageWorkerPool:
+    """Pool of StageClients for one stage with round-robin dispatch."""
+
+    def __init__(self, clients: List[StageClient], name: str = ""):
+        self._clients = clients
+        self._name = name
+        self._counter = 0
+
+    @property
+    def num_workers(self) -> int:
+        return len(self._clients)
+
+    async def forward(self, reqs):
+        """Round-robin dispatch to next available worker."""
+        idx = self._counter % len(self._clients)
+        self._counter += 1
+        return await self._clients[idx].forward(reqs)
+
+    def close(self):
+        for c in self._clients:
+            c.close()
+
+
 def patch_hunyuan_config():
     """HunyuanConfig inherits ``task_type`` from PipelineConfig without a
     default value, so ``HunyuanConfig()`` crashes.  Wrap __init__ to supply
