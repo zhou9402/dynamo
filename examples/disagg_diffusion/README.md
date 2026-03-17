@@ -90,8 +90,13 @@ workers in each pool.
 Use `;` to separate workers, `,` for TP GPUs within a worker:
 
 ```bash
-# 8 GPU — 2 workers per stage
+# 8 GPU — 2 workers per stage, single request
 GPU_ENC="0;4" GPU_DEN="1,2;5,6" GPU_VAE="3;7" python phase1_workers/run_e2e_sglang.py
+
+# 8 GPU — benchmark with 50 requests, 2 concurrent
+GPU_ENC="0;4" GPU_DEN="1,2;5,6" GPU_VAE="3;7" \
+  NUM_REQUESTS=50 CONCURRENCY=2 NUM_FRAMES=9 NUM_STEPS=3 \
+  python phase1_workers/run_e2e_sglang.py
 
 # Asymmetric pools (1 encoder, 3 denoisers, 1 VAE)
 GPU_ENC="0" GPU_DEN="1,2;3,4;5,6" GPU_VAE="7" python phase1_workers/run_e2e_sglang.py
