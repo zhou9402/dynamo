@@ -113,6 +113,18 @@ class NixlReceiveStage(PipelineStage):
                 reconstructed[k] = v
         for base, idx_map in indexed.items():
             reconstructed[base] = [idx_map[i] for i in sorted(idx_map)]
+        # Debug: log tensor stats after NIXL pull
+        for k, v in reconstructed.items():
+            if isinstance(v, list):
+                for i, t in enumerate(v):
+                    if hasattr(t, 'float'):
+                        f = t.float()
+                        logger.debug("NIXL_RECV %s[%d]: shape=%s dtype=%s mean=%.6f std=%.6f min=%.6f max=%.6f",
+                                    k, i, t.shape, t.dtype, f.mean().item(), f.std().item(), f.min().item(), f.max().item())
+            elif hasattr(v, 'float'):
+                f = v.float()
+                logger.debug("NIXL_RECV %s: shape=%s dtype=%s mean=%.6f std=%.6f min=%.6f max=%.6f",
+                            k, v.shape, v.dtype, f.mean().item(), f.std().item(), f.min().item(), f.max().item())
         from sglang_utils import inject_tensors_to_req
         inject_tensors_to_req(batch, reconstructed)
         return batch
@@ -164,6 +176,12 @@ class NixlSendStage(PipelineStage):
         tensors = self._extract_tensors(batch)
         if not tensors:
             return OutputBatch(output={}, timings=self._make_timings())
+
+        # Debug: log tensor stats before NIXL send
+        for k, t in tensors.items():
+            f = t.float()
+            logger.debug("NIXL_SEND %s: shape=%s dtype=%s mean=%.6f std=%.6f min=%.6f max=%.6f",
+                        k, t.shape, t.dtype, f.mean().item(), f.std().item(), f.min().item(), f.max().item())
 
         from nixl_transfer import NIXL_AVAILABLE
         if NIXL_AVAILABLE:
