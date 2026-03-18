@@ -47,13 +47,24 @@ CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(SCRIPT_DIR, "latent_caches"
 
 # ---------- Protocol ----------
 
+DEFAULT_NEGATIVE_PROMPT = (
+    "Bright tones, overexposed, static, blurred details, subtitles, style, "
+    "works, paintings, images, static, overall gray, worst quality, low quality, "
+    "JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, "
+    "poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, "
+    "still picture, messy background, three legs, many people in the background, "
+    "walking backwards"
+)
+
+
 class GenerateRequest(BaseModel):
     prompt: str = ""
-    negative_prompt: str = ""
+    negative_prompt: str = DEFAULT_NEGATIVE_PROMPT
     height: int = 384
     width: int = 640
     num_frames: int = 33
     seed: int = 42
+    guidance_scale: float = 1.0
     request_id: str = ""
     # If cache_id is set, this is a continuation request
     cache_id: str = ""
@@ -140,6 +151,23 @@ class HeliosContinuationWorker:
         # Build the pipeline (loads all models)
         self.pipeline = build_pipeline(self.server_args)
 
+        # Force Distilled-mode pipeline config (sglang may not auto-detect
+        # these when HeliosDMDScheduler isn't in its registry)
+        pc = self.server_args.pipeline_config
+        pc.is_enable_stage2 = True
+        pc.is_distilled = True
+        pc.is_amplify_first_chunk = True
+        pc.pyramid_num_inference_steps_list = [2, 2, 2]
+        pc.pyramid_num_stages = 3
+        if not pc.is_cfg_zero_star:
+            pc.is_cfg_zero_star = False
+        logger.info(
+            "Forced Distilled config: stage2=%s, distilled=%s, "
+            "amplify_first=%s, pyramid_steps=%s",
+            pc.is_enable_stage2, pc.is_distilled,
+            pc.is_amplify_first_chunk, pc.pyramid_num_inference_steps_list,
+        )
+
         # Patch the denoising stage for cache support
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.helios_denoising import (
             HeliosChunkedDenoisingStage,
@@ -156,7 +184,8 @@ class HeliosContinuationWorker:
         )
 
     def _build_req(self, prompt, negative_prompt="", height=384, width=640,
-                   num_frames=33, seed=42, request_id=None, extra=None):
+                   num_frames=33, seed=42, guidance_scale=1.0,
+                   request_id=None, extra=None):
         """Construct a Req suitable for pipeline.forward()."""
         from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
         from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -170,6 +199,7 @@ class HeliosContinuationWorker:
             height=height,
             width=width,
             seed=seed,
+            guidance_scale=guidance_scale,
             request_id=request_id or str(uuid.uuid4())[:8],
             output_file_name=f"{request_id or str(uuid.uuid4())[:8]}.mp4",
         )
@@ -258,11 +288,12 @@ class HeliosContinuationWorker:
                 }
                 req = self._build_req(
                     prompt=meta.get("prompt", ""),
-                    negative_prompt=meta.get("negative_prompt", ""),
+                    negative_prompt=meta.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT),
                     height=meta.get("height", 384),
                     width=meta.get("width", 640),
                     num_frames=request.num_frames,
                     seed=request.seed,
+                    guidance_scale=request.guidance_scale,
                     request_id=request_id,
                     extra=extra,
                 )
@@ -277,6 +308,7 @@ class HeliosContinuationWorker:
                         "width": request.width,
                         "num_frames": request.num_frames,
                         "seed": request.seed,
+                        "guidance_scale": request.guidance_scale,
                         "model_path": MODEL_PATH,
                     },
                 }
@@ -287,6 +319,7 @@ class HeliosContinuationWorker:
                     width=request.width,
                     num_frames=request.num_frames,
                     seed=request.seed,
+                    guidance_scale=request.guidance_scale,
                     request_id=request_id,
                     extra=extra,
                 )

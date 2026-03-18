@@ -402,6 +402,10 @@ def _patched_forward(self, batch, server_args):
                 server_args=server_args,
             )
 
+        # Some sglang versions return (latents, ...) tuple instead of tensor
+        if isinstance(latents, tuple):
+            latents = latents[0]
+
         # Extract first frame as image_latents for subsequent chunks
         if keep_first_frame and is_first_chunk and image_latents is None:
             image_latents = latents[:, :, 0:1, :, :]
