@@ -146,6 +146,22 @@ async def worker(runtime: DistributedRuntime):
     await denoiser_client.wait_for_instances()
     await vae_client.wait_for_instances()
 
+    # Wait for additional workers that may still be registering.
+    # wait_for_instances() returns after the first instance; model loading
+    # times vary, so poll until the count stabilizes or timeout.
+    WORKER_SETTLE_S = int(os.environ.get("WORKER_SETTLE_S", "30"))
+    if WORKER_SETTLE_S > 0:
+        import time as _time
+        deadline = _time.monotonic() + WORKER_SETTLE_S
+        prev_count = 0
+        while _time.monotonic() < deadline:
+            cur = len(denoiser_client.instance_ids())
+            if cur > prev_count:
+                prev_count = cur
+                logger.info("Discovered %d denoiser(s) so far, waiting for more…", cur)
+            await asyncio.sleep(2)
+        logger.info("Worker settle period done (%ds)", WORKER_SETTLE_S)
+
     # Discover registered worker instances per stage
     enc_ids = encoder_client.instance_ids()
     den_ids = denoiser_client.instance_ids()

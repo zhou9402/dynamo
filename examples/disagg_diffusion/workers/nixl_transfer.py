@@ -8,13 +8,19 @@ metadata (shapes, dtypes, NIXL descriptor ~1.5 KB) travels over the ZMQ
 control plane; actual tensor data (embeddings, latents) transfers
 GPU->GPU via NIXL RDMA.
 
+Follows the PersistentConnector pattern from embedding_transfer.py:
+- Each Sender/Receiver owns its PersistentConnector (one Connection/agent).
+- Remote._release is nooped to keep agent pairs alive.
+- The sender returns a ``readable_op`` handle that the caller must hold
+  until the receiver completes the RDMA pull.
+
 Usage inside PipelineStage.forward() (synchronous context)::
 
-    sender = NixlTensorSender()
-    meta = sender.send({"latents": tensor})   # registers & returns metadata
-    # ... pass meta via ZMQ ...
+    sender = NixlTensorSender()       # creates agent eagerly
+    meta, readable_op = sender.send({"latents": tensor})
+    # ... pass meta via ZMQ, hold readable_op until COMPLETE ...
 
-    receiver = NixlTensorReceiver()
+    receiver = NixlTensorReceiver()   # creates agent eagerly
     tensors = receiver.recv(meta, device="cuda")  # RDMA pull
 """
 
@@ -23,8 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import time
-from typing import Dict
+from typing import Dict, Tuple
 
 import torch
 
@@ -32,7 +37,12 @@ logger = logging.getLogger(__name__)
 
 try:
     import dynamo.nixl_connect as nixl_connect
-    NIXL_AVAILABLE = not os.environ.get("DISABLE_NIXL", "").lower() in ("1", "true", "yes")
+
+    NIXL_AVAILABLE = not os.environ.get("DISABLE_NIXL", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     if not NIXL_AVAILABLE:
         logger.info("NIXL disabled via DISABLE_NIXL env var")
 except ImportError:
@@ -40,96 +50,122 @@ except ImportError:
     logger.info("NIXL not available — falling back to ZMQ tensor transfer")
 
 
-class _PersistentConnector:
-    """Lazily-initialized NIXL Connector singleton per process."""
+# ---------------------------------------------------------------------------
+# PersistentConnector + Remote._release noop
+# ---------------------------------------------------------------------------
+# Exact pattern from components/src/dynamo/common/multimodal/embedding_transfer.py
 
-    _instance = None
+if NIXL_AVAILABLE:
 
-    @classmethod
-    async def get(cls):
-        if cls._instance is None:
-            cls._instance = nixl_connect.Connector()
-            await cls._instance.initialize()
-        return cls._instance
+    class PersistentConnector(nixl_connect.Connector):
+        """Connector that reuses a single Connection for all operations."""
+
+        def __init__(self):
+            super().__init__()
+            self._connection = None
+
+        async def _create_connection(self) -> nixl_connect.Connection:
+            if self._connection is None:
+                self._connection = nixl_connect.Connection(self, 1)
+                await self._connection.initialize()
+            return self._connection
+
+    # NOTE: We do NOT noop Remote._release here. Our recv() is synchronous
+    # (awaits wait_for_completion before returning), so the transfer is
+    # always complete before Remote is GC'd. Keeping the remote agent
+    # registered across requests causes NIXL_ERR_NOT_ALLOWED on the
+    # second add_remote_agent() call.
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _run_coro(coro):
+    """Run a coroutine from synchronous context (sglang scheduler thread)."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Shouldn't happen in sglang's scheduler, but be safe
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                return pool.submit(asyncio.run, coro).result(timeout=30)
+        return loop.run_until_complete(coro)
+    except RuntimeError:
+        return asyncio.run(coro)
+
+
+# ---------------------------------------------------------------------------
+# NixlTensorSender
+# ---------------------------------------------------------------------------
 
 
 class NixlTensorSender:
-    """Register GPU tensors as NIXL-readable. Returns metadata for the receiver.
+    """Register GPU tensors as NIXL-readable. Returns (metadata, readable_op).
 
-    Buffers are held until the receiver completes the RDMA pull (detected
-    via synchronous ``readable.status`` polling) or a configurable timeout
-    expires.  Previous implementation scheduled a ``_keep_alive`` background
-    task via ``asyncio.ensure_future``, but the event loop only runs during
-    ``run_until_complete`` and stops immediately after — so the background
-    task never executed, leaking GPU memory.
+    Each instance owns a PersistentConnector whose Connection (nixl_agent)
+    is created eagerly in ``__init__`` so UCX is fully initialized before
+    any transfer occurs.
+
+    The caller **must** hold ``readable_op`` until the receiver completes
+    the RDMA pull.
     """
 
-    BUFFER_TIMEOUT_S = float(os.environ.get("NIXL_BUFFER_TIMEOUT_S", "120"))
-
     def __init__(self):
-        # Each entry: (readable, flat_buffer_ref, creation_timestamp)
-        self._pending: list[tuple[object, torch.Tensor, float]] = []
+        self.connector = PersistentConnector()
+        # Eagerly create the Connection / nixl_agent so UCX is ready
+        _run_coro(self.connector._create_connection())
 
-    def send(self, tensors: Dict[str, torch.Tensor]) -> dict:
-        """Register tensors and return metadata dict (synchronous wrapper)."""
-        self._sweep()  # release completed / timed-out buffers first
-        return asyncio.get_event_loop().run_until_complete(self._async_send(tensors))
+    def send(self, tensors: Dict[str, torch.Tensor]) -> Tuple[dict, object]:
+        """Register tensors and return (metadata_dict, readable_op)."""
+        return _run_coro(self._async_send(tensors))
 
-    def _sweep(self):
-        """Poll pending readables: release completed or timed-out buffers."""
-        now = time.monotonic()
-        still_pending = []
-        for readable, flat, created_at in self._pending:
-            try:
-                status = readable.status  # synchronous — calls update_notifs()
-            except Exception:
-                # If status check fails, treat as completed to avoid leak
-                logger.debug("NIXL readable status check failed, releasing buffer")
-                continue
-            if hasattr(status, "name") and status.name == "COMPLETE":
-                logger.debug("NIXL readable completed, releasing buffer")
-            elif str(status) == "OperationStatus.COMPLETE":
-                logger.debug("NIXL readable completed, releasing buffer")
-            elif now - created_at > self.BUFFER_TIMEOUT_S:
-                logger.warning(
-                    "NIXL readable timed out after %.0fs, force-releasing buffer",
-                    now - created_at,
-                )
-            else:
-                still_pending.append((readable, flat, created_at))
-        self._pending = still_pending
-
-    async def _async_send(self, tensors: Dict[str, torch.Tensor]) -> dict:
-        connector = await _PersistentConnector.get()
-
+    async def _async_send(
+        self, tensors: Dict[str, torch.Tensor]
+    ) -> Tuple[dict, object]:
         # Flatten all tensors into a single contiguous buffer
         flat = torch.cat([t.contiguous().view(-1) for t in tensors.values()])
         descriptor = nixl_connect.Descriptor(flat)
-        readable = await connector.create_readable(descriptor)
+        readable = await self.connector.create_readable(descriptor)
         raw_meta = readable.metadata()
 
         meta = {
             "tensor_keys": list(tensors.keys()),
             "shapes": {k: list(t.shape) for k, t in tensors.items()},
-            "dtypes": {k: str(t.dtype).removeprefix("torch.") for k, t in tensors.items()},
-            "nixl_metadata": raw_meta.model_dump() if hasattr(raw_meta, "model_dump") else raw_meta,
+            "dtypes": {
+                k: str(t.dtype).removeprefix("torch.") for k, t in tensors.items()
+            },
+            "nixl_metadata": raw_meta.model_dump()
+            if hasattr(raw_meta, "model_dump")
+            else raw_meta,
         }
 
-        # Hold (readable, flat_buffer, timestamp) — prevents GC until sweep releases
-        self._pending.append((readable, flat, time.monotonic()))
-        return meta
+        # Return both — caller holds readable to prevent GC
+        return meta, readable
+
+
+# ---------------------------------------------------------------------------
+# NixlTensorReceiver
+# ---------------------------------------------------------------------------
 
 
 class NixlTensorReceiver:
-    """Pull tensors from a remote sender via NIXL RDMA."""
+    """Pull tensors from a remote sender via NIXL RDMA.
+
+    Each instance owns a PersistentConnector whose Connection (nixl_agent)
+    is created eagerly in ``__init__``.
+    """
+
+    def __init__(self):
+        self.connector = PersistentConnector()
+        # Eagerly create the Connection / nixl_agent so UCX is ready
+        _run_coro(self.connector._create_connection())
 
     def recv(self, meta: dict, device: str = "cuda") -> Dict[str, torch.Tensor]:
         """Pull tensors described by metadata. Returns {name: tensor}."""
-        return asyncio.get_event_loop().run_until_complete(self._async_recv(meta, device))
+        return _run_coro(self._async_recv(meta, device))
 
     async def _async_recv(self, meta: dict, device: str) -> Dict[str, torch.Tensor]:
-        connector = await _PersistentConnector.get()
-
         # Calculate total size and per-tensor specs
         specs = []
         total_bytes = 0
@@ -148,14 +184,14 @@ class NixlTensorReceiver:
         descriptor = nixl_connect.Descriptor(flat)
 
         rdma_meta = nixl_connect.RdmaMetadata.model_validate(meta["nixl_metadata"])
-        read_op = await connector.begin_read(rdma_meta, descriptor)
+        read_op = await self.connector.begin_read(rdma_meta, descriptor)
         await read_op.wait_for_completion()
 
         # Slice the flat buffer into individual tensors
         result = {}
         offset = 0
         for key, shape, dtype, size in specs:
-            result[key] = flat[offset:offset + size].view(dtype=dtype).reshape(shape)
+            result[key] = flat[offset : offset + size].view(dtype=dtype).reshape(shape)
             offset += size
 
         return result

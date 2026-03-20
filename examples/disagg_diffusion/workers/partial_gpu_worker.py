@@ -87,22 +87,48 @@ class NixlReceiveStage(PipelineStage):
     def __init__(self, tensor_fields: List[str]):
         super().__init__()
         self._tensor_fields = tensor_fields
-        self._receiver = None
+        # Eagerly create receiver so its NIXL agent/UCX endpoint is ready
+        # before any transfer occurs in this process.
+        # Only rank 0 uses NIXL — TP slaves skip to avoid UCX conflicts.
+        from nixl_transfer import NIXL_AVAILABLE
+        if NIXL_AVAILABLE and get_tp_rank() == 0:
+            from nixl_transfer import NixlTensorReceiver
+            self._receiver = NixlTensorReceiver()
+        else:
+            self._receiver = None
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        tp_world = get_tp_world_size()
+        tp_rank = get_tp_rank()
         nixl_meta = getattr(batch, "_nixl_transfer_meta", None)
-        if nixl_meta is not None:
-            return self._nixl_pull(batch, nixl_meta)
-        # Fallback: tensors arrived via ZMQ pickle — just move to GPU
+
+        if tp_world <= 1:
+            # No TP — simple path
+            if nixl_meta is not None and self._receiver is not None:
+                return self._nixl_pull(batch, nixl_meta)
+            return self._device_move(batch)
+
+        # TP mode: rank 0 decides NIXL vs ZMQ, broadcast decision to all ranks
+        # (torch.distributed.broadcast requires ALL ranks to participate)
+        import torch.distributed as dist
+        flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+        if tp_rank == 0 and nixl_meta is not None and self._receiver is not None:
+            flag[0] = 1
+        dist.broadcast(flag, src=0)
+
+        if flag.item():
+            # NIXL path: rank 0 pulls, then broadcasts tensors to all TP ranks
+            if tp_rank == 0:
+                batch = self._nixl_pull(batch, nixl_meta)
+            self._tp_broadcast_fields(batch, src_rank=0)
+            return batch
+
         return self._device_move(batch)
 
     _NIXL_PULL_MAX_RETRIES = int(os.environ.get("NIXL_PULL_MAX_RETRIES", "5"))
     _NIXL_PULL_BACKOFF_S = float(os.environ.get("NIXL_PULL_BACKOFF_S", "0.5"))
 
     def _nixl_pull(self, batch: Req, meta: dict) -> Req:
-        from nixl_transfer import NixlTensorReceiver
-        if self._receiver is None:
-            self._receiver = NixlTensorReceiver()
         # Retry on REMOTE_DISCONNECT — NIXL 1:N fan-out can be flaky on
         # initial peer connection when multiple receivers target one sender.
         last_err = None
@@ -118,7 +144,9 @@ class NixlReceiveStage(PipelineStage):
                         "NIXL pull attempt %d/%d failed: %s, retrying in %.1fs",
                         attempt + 1, self._NIXL_PULL_MAX_RETRIES, e, wait,
                     )
-                    self._receiver = NixlTensorReceiver()  # fresh receiver
+                    # Reuse the same receiver — PersistentConnector handles
+                    # agent reuse.  Creating a fresh receiver was itself a
+                    # source of REMOTE_DISCONNECT (new agent overwhelms UCX).
                     time.sleep(wait)
                     last_err = e
                     continue
@@ -153,6 +181,55 @@ class NixlReceiveStage(PipelineStage):
         inject_tensors_to_req(batch, reconstructed)
         return batch
 
+    def _tp_broadcast_fields(self, batch: Req, src_rank: int = 0) -> None:
+        """Broadcast tensor fields from src_rank to all TP ranks.
+
+        Uses broadcast_object_list for shape/dtype metadata, then
+        point-to-point broadcast for GPU tensor data.
+        """
+        import torch.distributed as dist
+        tp_rank = get_tp_rank()
+        device = torch.device("cuda")
+
+        # Collect field data on rank 0, None on others
+        field_data = [None]  # single-element list for broadcast_object_list
+        if tp_rank == src_rank:
+            meta = {}
+            for field in self._tensor_fields:
+                val = getattr(batch, field, None)
+                if val is None:
+                    continue
+                if isinstance(val, list):
+                    meta[field] = [{"shape": list(t.shape), "dtype": str(t.dtype)} for t in val if isinstance(t, torch.Tensor)]
+                elif isinstance(val, torch.Tensor):
+                    meta[field] = {"shape": list(val.shape), "dtype": str(val.dtype)}
+            field_data = [meta]
+
+        dist.broadcast_object_list(field_data, src=src_rank)
+        meta = field_data[0]
+        if meta is None:
+            return
+
+        # Allocate tensors on non-src ranks, then broadcast data
+        for field, info in meta.items():
+            if isinstance(info, list):
+                # List of tensors
+                if tp_rank == src_rank:
+                    tensors = getattr(batch, field)
+                else:
+                    tensors = [torch.empty(m["shape"], dtype=getattr(torch, m["dtype"].removeprefix("torch.")), device=device) for m in info]
+                    setattr(batch, field, tensors)
+                for t in tensors:
+                    dist.broadcast(t, src=src_rank)
+            elif isinstance(info, dict):
+                # Single tensor
+                if tp_rank != src_rank:
+                    t = torch.empty(info["shape"], dtype=getattr(torch, info["dtype"].removeprefix("torch.")), device=device)
+                    setattr(batch, field, t)
+                else:
+                    t = getattr(batch, field)
+                dist.broadcast(t, src=src_rank)
+
     def _device_move(self, batch: Req) -> Req:
         """Fallback: move CPU tensors to GPU (ZMQ pickle path)."""
         device = torch.device("cuda")
@@ -180,14 +257,34 @@ class NixlSendStage(PipelineStage):
 
     Actual tensor data stays on GPU — only metadata travels over ZMQ.
     Falls back to sending raw tensors when NIXL is unavailable.
+
+    Holds ``readable_op`` handles in ``_active_readables`` until the
+    receiver completes the RDMA pull — prevents premature GC of the
+    Connection/Descriptor/GPU buffer that causes REMOTE_DISCONNECT.
     """
 
     def __init__(self, output_fields: List[str]):
         super().__init__()
         self._output_fields = output_fields
-        self._sender = None
+        # Eagerly create sender so its NIXL agent/UCX endpoint is ready
+        # before any transfer occurs in this process.
+        # Only rank 0 uses NIXL — TP slaves skip to avoid UCX conflicts.
+        from nixl_transfer import NIXL_AVAILABLE
+        if NIXL_AVAILABLE and get_tp_rank() == 0:
+            from nixl_transfer import NixlTensorSender
+            self._sender = NixlTensorSender()
+        else:
+            self._sender = None
+        # (readable_op, flat_buffer_ref) — kept alive until receiver completes
+        self._active_readables: list[tuple[object, object]] = []
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        # TP rank > 0: only rank 0's output is returned to the orchestrator
+        if get_tp_rank() != 0:
+            return OutputBatch(output={}, metrics=RequestMetrics(request_id="nixl"))
+
+        self._poll_completed()  # release finished readables first
+
         tensors = self._extract_tensors(batch)
         if not tensors:
             return OutputBatch(output={}, metrics=RequestMetrics(request_id="nixl"))
@@ -199,9 +296,25 @@ class NixlSendStage(PipelineStage):
                         k, t.shape, t.dtype, f.mean().item(), f.std().item(), f.min().item(), f.max().item())
 
         from nixl_transfer import NIXL_AVAILABLE
-        if NIXL_AVAILABLE:
+        if NIXL_AVAILABLE and self._sender is not None:
             return self._nixl_send(tensors)
         return self._fallback_send(tensors)
+
+    def _poll_completed(self):
+        """Release readable_ops whose RDMA pull has completed."""
+        still_active = []
+        for readable, buf_ref in self._active_readables:
+            try:
+                status = readable.status
+                name = getattr(status, "name", str(status))
+                if "COMPLETE" in name:
+                    logger.debug("NIXL readable completed, releasing buffer")
+                    continue  # drop — GC releases descriptor + buffer
+                still_active.append((readable, buf_ref))
+            except Exception:
+                logger.warning("NIXL readable status check failed, keeping alive to be safe")
+                still_active.append((readable, buf_ref))
+        self._active_readables = still_active
 
     def _extract_tensors(self, batch: Req) -> Dict[str, torch.Tensor]:
         """Flatten list-valued fields into individual tensors."""
@@ -224,10 +337,9 @@ class NixlSendStage(PipelineStage):
         return result
 
     def _nixl_send(self, tensors: Dict[str, torch.Tensor]) -> OutputBatch:
-        from nixl_transfer import NixlTensorSender
-        if self._sender is None:
-            self._sender = NixlTensorSender()
-        meta = self._sender.send(tensors)
+        meta, readable_op = self._sender.send(tensors)
+        # Hold readable_op (+ implicit buffer ref) until receiver completes pull
+        self._active_readables.append((readable_op, None))
         return OutputBatch(output={"_nixl_transfer_meta": meta}, metrics=RequestMetrics(request_id="nixl"))
 
     def _fallback_send(self, tensors: Dict[str, torch.Tensor]) -> OutputBatch:

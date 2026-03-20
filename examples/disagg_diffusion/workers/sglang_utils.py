@@ -223,22 +223,41 @@ class StageClient:
     FORWARD_TIMEOUT_S = float(os.environ.get("STAGE_FORWARD_TIMEOUT_S", "120"))
 
     def __init__(self, endpoint: str, name: str = ""):
-        import zmq.asyncio
+        import zmq, zmq.asyncio
+        self._zmq = zmq
         self._name = name
+        self._endpoint = endpoint
         self._ctx = zmq.asyncio.Context()
         self._sock = self._ctx.socket(zmq.REQ)
         self._sock.connect(endpoint)
         self._lock = asyncio.Lock()
         logger.info("StageClient(%s) connected to %s", name, endpoint)
 
+    def _reset_socket(self):
+        """Recreate ZMQ socket after a timeout leaves it in a broken state.
+
+        ZMQ REQ sockets enforce strict send/recv alternation.  If recv
+        times out after send, the socket is stuck waiting for a reply and
+        all subsequent sends raise ``EFSM``.  The only recovery is to
+        close and reconnect.
+        """
+        self._sock.close(linger=0)
+        self._sock = self._ctx.socket(self._zmq.REQ)
+        self._sock.connect(self._endpoint)
+        logger.warning("StageClient(%s) reset ZMQ socket after timeout", self._name)
+
     async def forward(self, reqs):
         """Send request(s) and receive response (with timeout)."""
         async with self._lock:
             await self._sock.send_pyobj(reqs)
-            return await asyncio.wait_for(
-                self._sock.recv_pyobj(),
-                timeout=self.FORWARD_TIMEOUT_S,
-            )
+            try:
+                return await asyncio.wait_for(
+                    self._sock.recv_pyobj(),
+                    timeout=self.FORWARD_TIMEOUT_S,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                self._reset_socket()
+                raise
 
     def close(self):
         self._sock.close()
