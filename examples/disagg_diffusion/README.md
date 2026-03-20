@@ -1,60 +1,180 @@
-# Disaggregated Diffusion Inference POC
+# Disaggregated Diffusion Inference (HunyuanVideo)
 
-Split a monolithic diffusion pipeline (Text Encoder → Transformer → VAE) into
-independent stages that can run on separate GPUs and scale independently.
+Split a monolithic video diffusion pipeline into independent Dynamo workers on separate GPUs.
+Tensor data transfers between stages use **NIXL RDMA** (GPU-direct); only small metadata
+travels over Dynamo RPC.
 
-Design doc: [docs/design/disaggregated_diffusion.md](../../docs/design/disaggregated_diffusion.md)
+Supports HunyuanVideo (13B, dual Llama+CLIP encoder) and Wan2.2-TI2V models.
 
-## Phases
+## Architecture
 
-### Phase 0: Offline Validation (no Dynamo)
-
-Proves that diffusers supports split execution: encode, denoise, and VAE decode
-can run independently with serialized intermediate tensors.
-
-```bash
-# Single GPU, ~24 GB VRAM for FLUX.1-schnell
-python phase0_validate/validate_split.py \
-    --model black-forest-labs/FLUX.1-schnell \
-    --prompt "A photo of a cat sitting on a windowsill" \
-    --output-dir /tmp/disagg_validate
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Orchestrator (HTTP API)                         │
+│                        run_disagg.py                                │
+└──────┬──────────────────────┬───────────────────────────┬───────────┘
+       │ Dynamo RPC           │ Dynamo RPC                │ Dynamo RPC
+       │ (metadata)           │ (metadata)                │ (metadata)
+       ▼                      ▼                           ▼
+┌──────────────┐   ┌─────────────────────┐   ┌──────────────────────┐
+│ Encoder      │   │ Denoiser            │   │ VAE Decoder          │
+│ Worker       │   │ Worker              │   │ Worker               │
+│              │   │                     │   │                      │
+│ GPU 0        │   │ GPU 1,2 (TP=2)     │   │ GPU 3                │
+│ ~18 GB VRAM  │   │ ~24 GB VRAM/GPU    │   │ ~6 GB VRAM           │
+│              │   │                     │   │                      │
+│ Llama 8B     │   │ HunyuanVideo DiT   │   │ 3D VAE               │
+│ + CLIP       │   │ 9.5B params        │   │                      │
+└──────┬───────┘   └──────┬──────────────┘   └──────┬───────────────┘
+       │                  │                         │
+       └──── NIXL RDMA ──►└──── NIXL RDMA ─────────►│
+          (embeddings,          (latents,
+           GPU-direct)           GPU-direct)
 ```
 
-### Phase 1: Dynamo Stage Workers
+### Request Flow
 
-Three independent Dynamo workers, each loading only its model component:
-
-```bash
-# Terminal 1: Encoder Worker (loads CLIP + T5, ~12 GB)
-python phase1_workers/encoder_worker.py --model black-forest-labs/FLUX.1-schnell
-
-# Terminal 2: Denoiser Worker (loads Transformer, ~24 GB)
-python phase1_workers/denoiser_worker.py --model black-forest-labs/FLUX.1-schnell
-
-# Terminal 3: VAE Worker (loads VAE, ~1 GB)
-python phase1_workers/vae_worker.py --model black-forest-labs/FLUX.1-schnell
+```
+ 1. User ──POST /v1/videos/generations──► Orchestrator
+ 2. Orchestrator ──EncoderRequest──► Encoder Worker
+ 3.   Encoder: TextEncoding → NixlSendStage (register embeddings on GPU)
+ 4.   Encoder ──{nixl_metadata}──► Orchestrator
+ 5. Orchestrator ──DenoiserRequest + nixl_meta──► Denoiser Worker
+ 6.   Denoiser: NixlReceive (RDMA pull embeddings) → LatentPrep → Denoise (N steps) → NixlSend
+ 7.   Denoiser ──{nixl_metadata}──► Orchestrator
+ 8. Orchestrator ──VAERequest + nixl_meta──► VAE Worker
+ 9.   VAE: NixlReceive (RDMA pull latents) → Decode → Save MP4
+10.   VAE ──{video_path}──► Orchestrator ──► User
 ```
 
-### Phase 2: Orchestrator
+### Worker Internal Architecture
 
-Chains the three stage endpoints into an end-to-end generation pipeline:
+Each worker wraps an SGLang Scheduler subprocess:
 
-```bash
-python phase2_orchestrator/run_disagg.py \
-    --prompt "A photo of a cat sitting on a windowsill" \
-    --output /tmp/disagg_output.png
+```
+Dynamo Worker Process (e.g. encoder_worker.py)
+├── @dynamo_worker
+│   └── serve_endpoint("generate")     ← Dynamo RPC from orchestrator
+│       └── StageClient.forward()      ← ZMQ to local Scheduler
+│
+└── SGLang Scheduler subprocess        ← spawned by launch_partial_server()
+    └── PartialGPUWorker
+        ├── TextEncodingStage          ← model inference
+        └── NixlSendStage             ← register tensors for RDMA
 ```
 
-Or use the all-in-one launch script:
+### Pipeline Parallelism
+
+Multiple requests overlap across stages:
+
+```
+Request 1:  [ Encoder ] ──► [ Denoiser ~~~~~~~~ ] ──► [  VAE  ]
+Request 2:               [ Encoder ] ──► [ Denoiser ~~~~~~~~ ] ──► [  VAE  ]
+Request 3:                            [ Encoder ] ──► [ Denoiser ~~~~~~~~ ]
+```
+
+### Multi-Worker Scaling
+
+Each stage supports **multiple workers** — just launch more processes with the
+same Dynamo component name.  They register via etcd and the orchestrator
+round-robins requests automatically.  Use `;` in GPU specs to separate workers:
+
+```
+          ┌─ Encoder_0 (GPU 0) ─┐    ┌─ Denoiser_0 TP=2 (GPU 1,2) ─┐    ┌─ VAE_0 (GPU 3) ─┐
+ Request ─┤                      ├──►─┤                               ├──►─┤                  ├─► Video
+          └─ Encoder_1 (GPU 4) ─┘    └─ Denoiser_1 TP=2 (GPU 5,6) ─┘    └─ VAE_1 (GPU 7) ─┘
+            round-robin                  round-robin                        round-robin
+```
 
 ```bash
-bash launch/run_all.sh black-forest-labs/FLUX.1-schnell "A photo of a cat"
+# 8 GPU — 2 workers per stage
+GPU_ENC="0;4" GPU_DEN="1,2;5,6" GPU_VAE="3;7" ./run_all.sh --test --quick
+
+# Asymmetric (1 encoder, 3 denoisers, 1 VAE)
+GPU_ENC="0" GPU_DEN="1,2;3,4;5,6" GPU_VAE="7" ./run_all.sh
 ```
+
+Single-worker specs (no `;`) are fully backward compatible.
+
+No pre-pairing is needed — each `send()` allocates a new NIXL buffer and
+the `_keep_alive` coroutine holds it until the receiver's RDMA pull completes,
+so any sender→receiver combination is safe.
+
+## Quick Start
+
+One script launches everything (etcd + 3 workers + orchestrator):
+
+```bash
+conda activate omni
+export HF_HUB_CACHE=/path/to/huggingface/hub
+
+# Launch all services + send a test request
+./run_all.sh --test
+
+# Quick smoke test (9 frames, 3 steps, ~30s)
+./run_all.sh --test --quick
+
+# Just launch services (no test request)
+./run_all.sh
+```
+
+Or launch each service manually:
+
+```bash
+# Terminal 0: etcd
+etcd --data-dir /tmp/etcd_disagg --listen-client-urls http://0.0.0.0:2379
+
+# Terminal 1-3: Workers
+CUDA_VISIBLE_DEVICES=0   python workers/encoder_worker.py
+CUDA_VISIBLE_DEVICES=1,2 python workers/denoiser_worker.py
+CUDA_VISIBLE_DEVICES=3   python workers/vae_worker.py
+
+# Terminal 4: Orchestrator
+python orchestrator/run_disagg.py
+```
+
+Generate a video (61 frames, 50 steps, 544x960 by default):
+
+```bash
+curl -X POST http://localhost:8080/v1/videos/generations \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "A golden retriever running on a sunny beach with waves crashing"}'
+```
+
+## Workers
+
+| Worker | Model Component | VRAM | Dynamo Endpoint |
+|--------|----------------|------|-----------------|
+| `encoder_worker.py` | Llama 8B + CLIP text encoders | ~18 GB | `disagg_diffusion.encoder.generate` |
+| `denoiser_worker.py` | HunyuanVideo DiT (TP=2) | ~24 GB/GPU | `disagg_diffusion.denoiser.generate` |
+| `vae_worker.py` | 3D VAE decoder | ~6 GB | `disagg_diffusion.vae.generate` |
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_PATH` | `hunyuanvideo-community/HunyuanVideo` | HuggingFace model ID or local path |
+| `GPU_ENC` / `GPU_DEN` / `GPU_VAE` | `0` / `1,2` / `3` | GPU assignment per stage (use `;` to launch multiple workers, e.g. `"0;4"`) |
+| `TP_SIZE` | auto from `GPU_DEN` | Tensor parallelism for denoiser |
+| `PORT` | `8080` | Orchestrator HTTP port |
+| `OUTPUT_DIR` | `/tmp/disagg_videos` | Video output directory |
 
 ## Supported Models
 
-Any diffusers pipeline that exposes `encode_prompt()` and supports
-`prompt_embeds` / `output_type="latent"`. Tested with:
+- **`hunyuanvideo-community/HunyuanVideo`** — 13B, dual encoder (Llama 8B + CLIP), recommended
+- `Wan-AI/Wan2.2-TI2V-5B-Diffusers` — 5B, single encoder
 
-- `black-forest-labs/FLUX.1-schnell` (recommended, 4 steps)
-- `stabilityai/stable-diffusion-3.5-medium`
+## Roadmap
+
+- [x] **Multi-worker scaling** — launch N workers per stage via `run_all.sh`; Dynamo auto-discovers and round-robins
+- [ ] **Dynamic scaling** — auto-scale workers based on queue depth, add/remove denoiser replicas
+- [ ] **Streaming output** — stream decoded frames to client as they are produced
+- [ ] **Orchestrator improvements** — smarter scheduling, request priority, load balancing across replicas
+- [ ] **Metrics & observability** — per-stage latency, GPU utilization, NIXL throughput, Prometheus export
+- [ ] **Request cancellation** — cancel in-flight requests, free GPU resources immediately
+
+## Dependencies
+
+```bash
+pip install ai-dynamo-runtime sglang imageio imageio-ffmpeg pyzmq setproctitle
+```
