@@ -73,10 +73,23 @@ async def worker(runtime: DistributedRuntime):
                 seed=request.get("seed", 42),
             )
 
-            # Pass NIXL metadata for NixlReceiveStage to RDMA-pull latents
+            # Pass NIXL metadata or raw tensor data for NixlReceiveStage
             transfer_meta = request.get("transfer_meta", {})
+            tensor_data = request.get("tensor_data", {})
             if transfer_meta:
                 req._nixl_transfer_meta = transfer_meta
+            elif tensor_data:
+                # ZMQ fallback: deserialize latents and inject onto Req
+                import torch, base64, io
+                from sglang_utils import inject_tensors_to_req
+                tensors = {}
+                for k, v in tensor_data.items():
+                    if isinstance(v, list):
+                        tensors[k] = [torch.load(io.BytesIO(base64.b64decode(b)), weights_only=True) for b in v]
+                    else:
+                        tensors[k] = torch.load(io.BytesIO(base64.b64decode(v)), weights_only=True)
+                inject_tensors_to_req(req, tensors)
+                logger.info("Injected %d tensor fields via ZMQ fallback", len(tensors))
 
             output = await client.forward([req])
             if output.error:
@@ -105,9 +118,8 @@ async def worker(runtime: DistributedRuntime):
 
     # ── Serve Dynamo endpoints ───────────────────────────────────────
 
-    ns = runtime.namespace("disagg_diffusion")
-    gen_ep = ns.component("vae").endpoint("generate")
-    health_ep = ns.component("vae").endpoint("health")
+    gen_ep = runtime.endpoint("disagg_diffusion.vae.generate")
+    health_ep = runtime.endpoint("disagg_diffusion.vae.health")
 
     logger.info("Serving: disagg_diffusion.vae.generate + health")
     try:

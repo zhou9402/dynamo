@@ -79,10 +79,23 @@ async def worker(runtime: DistributedRuntime):
             )
             req.do_classifier_free_guidance = (req.guidance_scale > 1.0)
 
-            # Pass NIXL metadata for NixlReceiveStage to RDMA-pull embeddings
+            # Pass NIXL metadata or raw tensor data for NixlReceiveStage
             transfer_meta = request.get("transfer_meta", {})
+            tensor_data = request.get("tensor_data", {})
             if transfer_meta:
                 req._nixl_transfer_meta = transfer_meta
+            elif tensor_data:
+                # ZMQ fallback: deserialize tensors and inject onto Req
+                import torch, base64, io
+                from sglang_utils import inject_tensors_to_req
+                tensors = {}
+                for k, v in tensor_data.items():
+                    if isinstance(v, list):
+                        tensors[k] = [torch.load(io.BytesIO(base64.b64decode(b)), weights_only=True) for b in v]
+                    else:
+                        tensors[k] = torch.load(io.BytesIO(base64.b64decode(v)), weights_only=True)
+                inject_tensors_to_req(req, tensors)
+                logger.info("Injected %d tensor fields via ZMQ fallback", len(tensors))
 
             output = await client.forward([req])
             if output.error:
@@ -91,8 +104,20 @@ async def worker(runtime: DistributedRuntime):
 
             result = output.output
             transfer_meta_out = result.get("_nixl_transfer_meta", {})
-            logger.info("Denoised — NIXL latent metadata ready")
-            yield {"transfer_meta": transfer_meta_out, "shape": []}
+            if transfer_meta_out:
+                logger.info("Denoised — NIXL latent metadata ready")
+                yield {"transfer_meta": transfer_meta_out, "shape": []}
+            else:
+                # ZMQ fallback for latents
+                import torch, base64, io
+                td = {}
+                for k, v in result.items():
+                    if isinstance(v, torch.Tensor):
+                        buf = io.BytesIO()
+                        torch.save(v.cpu(), buf)
+                        td[k] = base64.b64encode(buf.getvalue()).decode()
+                logger.info("Denoised — ZMQ fallback (%d tensor fields)", len(td))
+                yield {"transfer_meta": {}, "tensor_data": td, "shape": []}
 
         except Exception as e:
             logger.error("Denoiser generate failed: %s", e, exc_info=True)
@@ -106,9 +131,8 @@ async def worker(runtime: DistributedRuntime):
 
     # ── Serve Dynamo endpoints ───────────────────────────────────────
 
-    ns = runtime.namespace("disagg_diffusion")
-    gen_ep = ns.component("denoiser").endpoint("generate")
-    health_ep = ns.component("denoiser").endpoint("health")
+    gen_ep = runtime.endpoint("disagg_diffusion.denoiser.generate")
+    health_ep = runtime.endpoint("disagg_diffusion.denoiser.health")
 
     logger.info("Serving: disagg_diffusion.denoiser.generate + health")
     try:

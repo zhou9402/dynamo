@@ -74,8 +74,26 @@ async def worker(runtime: DistributedRuntime):
 
             result = output.output
             transfer_meta = result.get("_nixl_transfer_meta", {})
-            logger.info("Encoded prompt — NIXL metadata ready")
-            yield {"transfer_meta": transfer_meta, "shapes": {}}
+            if transfer_meta:
+                logger.info("Encoded prompt — NIXL metadata ready")
+                yield {"transfer_meta": transfer_meta, "shapes": {}}
+            else:
+                # ZMQ fallback: forward raw tensors (when NIXL is disabled)
+                import torch, base64, io
+                tensor_data = {}
+                for k, v in result.items():
+                    if isinstance(v, torch.Tensor):
+                        buf = io.BytesIO()
+                        torch.save(v.cpu(), buf)
+                        tensor_data[k] = base64.b64encode(buf.getvalue()).decode()
+                    elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                        tensor_data[k] = []
+                        for t in v:
+                            buf = io.BytesIO()
+                            torch.save(t.cpu(), buf)
+                            tensor_data[k].append(base64.b64encode(buf.getvalue()).decode())
+                logger.info("Encoded prompt — ZMQ fallback (%d tensor fields)", len(tensor_data))
+                yield {"transfer_meta": {}, "tensor_data": tensor_data, "shapes": {}}
 
         except Exception as e:
             logger.error("Encoder generate failed: %s", e, exc_info=True)
@@ -86,9 +104,8 @@ async def worker(runtime: DistributedRuntime):
 
     # ── Serve Dynamo endpoints ───────────────────────────────────────
 
-    ns = runtime.namespace("disagg_diffusion")
-    gen_ep = ns.component("encoder").endpoint("generate")
-    health_ep = ns.component("encoder").endpoint("health")
+    gen_ep = runtime.endpoint("disagg_diffusion.encoder.generate")
+    health_ep = runtime.endpoint("disagg_diffusion.encoder.health")
 
     logger.info("Serving: disagg_diffusion.encoder.generate + health")
     try:

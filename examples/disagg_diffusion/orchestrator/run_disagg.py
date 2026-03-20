@@ -8,8 +8,10 @@ Persistent server that accepts video generation requests and chains
 Encoder → Denoiser → VAE via Dynamo RPC + NIXL RDMA.
 
 Pipeline parallelism: multiple requests can be in different stages
-simultaneously. Per-stage semaphores control backpressure so each
-GPU processes one request at a time, while the pipeline stays full.
+simultaneously. Per-stage WorkerManagers track busy/idle state for
+each GPU worker and dispatch requests to specific instances via
+``client.direct()``, enabling backpressure-aware scheduling and
+per-worker observability through ``/pipeline/status``.
 
 Each stage worker wraps an SGLang Scheduler subprocess via
 launch_partial_server(), supporting TP for the denoiser and NIXL RDMA
@@ -45,6 +47,7 @@ from protocol import (  # noqa: E402
     HealthRequest,
 )
 from dynamo.runtime import DistributedRuntime, dynamo_worker  # noqa: E402
+from worker_manager import WorkerManager  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -52,19 +55,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 HOST = os.environ.get("HOST", "0.0.0.0")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/disagg_videos")
 MAX_PIPELINE_DEPTH = int(os.environ.get("MAX_PIPELINE_DEPTH", "4"))
-
-
-async def call_stage(client, request_json: str) -> dict:
-    result = None
-    stream = await client.round_robin(request_json)
-    async for chunk in stream:
-        data = chunk.data() if hasattr(chunk, "data") else chunk
-        if isinstance(data, str):
-            data = json.loads(data)
-        result = data
-    if result is None:
-        raise RuntimeError("Empty response from stage")
-    return result
+STAGE_DISPATCH_RETRIES = int(os.environ.get("STAGE_DISPATCH_RETRIES", "2"))
 
 
 async def query_stage_health(health_client, stage_name: str) -> dict:
@@ -136,14 +127,13 @@ class PipelineTracker:
 
 @dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
-    ns = runtime.namespace("disagg_diffusion")
-    encoder_client = await ns.component("encoder").endpoint("generate").client()
-    denoiser_client = await ns.component("denoiser").endpoint("generate").client()
-    vae_client = await ns.component("vae").endpoint("generate").client()
+    encoder_client = await runtime.endpoint("disagg_diffusion.encoder.generate").client()
+    denoiser_client = await runtime.endpoint("disagg_diffusion.denoiser.generate").client()
+    vae_client = await runtime.endpoint("disagg_diffusion.vae.generate").client()
 
-    encoder_health_client = await ns.component("encoder").endpoint("health").client()
-    denoiser_health_client = await ns.component("denoiser").endpoint("health").client()
-    vae_health_client = await ns.component("vae").endpoint("health").client()
+    encoder_health_client = await runtime.endpoint("disagg_diffusion.encoder.health").client()
+    denoiser_health_client = await runtime.endpoint("disagg_diffusion.denoiser.health").client()
+    vae_health_client = await runtime.endpoint("disagg_diffusion.vae.health").client()
 
     health_clients = {
         "encoder": encoder_health_client,
@@ -160,30 +150,43 @@ async def worker(runtime: DistributedRuntime):
     enc_ids = encoder_client.instance_ids()
     den_ids = denoiser_client.instance_ids()
     vae_ids = vae_client.instance_ids()
-    n_enc, n_den, n_vae = len(enc_ids) or 1, len(den_ids) or 1, len(vae_ids) or 1
-    logger.info("Workers: encoder=%d, denoiser=%d, vae=%d", n_enc, n_den, n_vae)
+    logger.info(
+        "Workers: encoder=%d %s, denoiser=%d %s, vae=%d %s",
+        len(enc_ids), enc_ids, len(den_ids), den_ids, len(vae_ids), vae_ids,
+    )
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    stage_sems = {
-        "encoder": asyncio.Semaphore(n_enc),
-        "denoiser": asyncio.Semaphore(n_den),
-        "vae": asyncio.Semaphore(n_vae),
+    managers: Dict[str, WorkerManager] = {
+        "encoder": WorkerManager("encoder", encoder_client, enc_ids),
+        "denoiser": WorkerManager("denoiser", denoiser_client, den_ids),
+        "vae": WorkerManager("vae", vae_client, vae_ids),
     }
-    pipeline_depth = MAX_PIPELINE_DEPTH if MAX_PIPELINE_DEPTH > 0 else (n_enc + n_den + n_vae)
+    n_workers_total = sum(m.worker_count for m in managers.values())
+    pipeline_depth = MAX_PIPELINE_DEPTH if MAX_PIPELINE_DEPTH > 0 else n_workers_total
     admission = asyncio.Semaphore(pipeline_depth)
     tracker = PipelineTracker()
 
-    async def run_stage(name: str, request_id: str, client, request_json: str) -> dict:
-        """Run a single stage with semaphore gating and tracking."""
-        async with stage_sems[name]:
-            await tracker.enter(request_id, name)
-            t0 = time.monotonic()
-            result = await call_stage(client, request_json)
-            elapsed = time.monotonic() - t0
-            await tracker.leave(request_id, name, elapsed)
-            logger.info("[%s] %s: %.2fs", request_id, name.capitalize(), elapsed)
-            return result, elapsed
+    async def dispatch_with_retry(
+        mgr: WorkerManager, request_id: str, request_json: str,
+    ) -> tuple:
+        """Dispatch to a stage worker; on failure retry on a different worker."""
+        for attempt in range(STAGE_DISPATCH_RETRIES + 1):
+            wid = await mgr.acquire_worker()
+            try:
+                result, elapsed = await mgr.dispatch(wid, request_id, request_json)
+                if "error" in result and result["error"]:
+                    raise RuntimeError(result["error"])
+                return result, elapsed, wid
+            except Exception as e:
+                logger.warning(
+                    "[%s] %s worker %d failed (attempt %d/%d): %s",
+                    request_id, mgr.stage_name, wid, attempt + 1,
+                    STAGE_DISPATCH_RETRIES + 1, e,
+                )
+                if attempt >= STAGE_DISPATCH_RETRIES:
+                    raise
+        raise RuntimeError("unreachable")
 
     async def handle_generate(request: dict) -> dict:
         request_id = str(uuid.uuid4())[:8]
@@ -191,35 +194,53 @@ async def worker(runtime: DistributedRuntime):
         timings: Dict[str, float] = {}
 
         async with admission:
-            enc_req = EncoderRequest(
-                prompt=request["prompt"],
-                negative_prompt=request.get("negative_prompt", ""),
-                guidance_scale=request.get("guidance_scale", 1.0),
-            )
-            enc_resp, timings["encoder_s"] = await run_stage(
-                "encoder", request_id, encoder_client, enc_req.model_dump_json(),
-            )
+            try:
+                # Stage 1: Encoder
+                enc_req = EncoderRequest(
+                    prompt=request["prompt"],
+                    negative_prompt=request.get("negative_prompt", ""),
+                    guidance_scale=request.get("guidance_scale", 1.0),
+                )
+                await tracker.enter(request_id, "encoder")
+                enc_resp, timings["encoder_s"], enc_wid = await dispatch_with_retry(
+                    managers["encoder"], request_id, enc_req.model_dump_json(),
+                )
+                await tracker.leave(request_id, "encoder", timings["encoder_s"])
+                logger.info("[%s] Encoder (worker %d): %.2fs", request_id, enc_wid, timings["encoder_s"])
 
-            den_req = DenoiserRequest(
-                transfer_meta=enc_resp["transfer_meta"],
-                height=request.get("height", 544),
-                width=request.get("width", 960),
-                num_frames=request.get("num_frames", 61),
-                num_inference_steps=request.get("num_inference_steps", 50),
-                guidance_scale=request.get("guidance_scale", 1.0),
-                seed=seed,
-            )
-            den_resp, timings["denoiser_s"] = await run_stage(
-                "denoiser", request_id, denoiser_client, den_req.model_dump_json(),
-            )
+                # Stage 2: Denoiser
+                den_req = DenoiserRequest(
+                    transfer_meta=enc_resp.get("transfer_meta", {}),
+                    tensor_data=enc_resp.get("tensor_data", {}),
+                    height=request.get("height", 544),
+                    width=request.get("width", 960),
+                    num_frames=request.get("num_frames", 61),
+                    num_inference_steps=request.get("num_inference_steps", 50),
+                    guidance_scale=request.get("guidance_scale", 1.0),
+                    seed=seed,
+                )
+                await tracker.enter(request_id, "denoiser")
+                den_resp, timings["denoiser_s"], den_wid = await dispatch_with_retry(
+                    managers["denoiser"], request_id, den_req.model_dump_json(),
+                )
+                await tracker.leave(request_id, "denoiser", timings["denoiser_s"])
+                logger.info("[%s] Denoiser (worker %d): %.2fs", request_id, den_wid, timings["denoiser_s"])
 
-            vae_req = VAEDecodeRequest(
-                transfer_meta=den_resp["transfer_meta"],
-                request_id=request_id,
-            )
-            vae_resp, timings["vae_s"] = await run_stage(
-                "vae", request_id, vae_client, vae_req.model_dump_json(),
-            )
+                # Stage 3: VAE
+                vae_req = VAEDecodeRequest(
+                    transfer_meta=den_resp.get("transfer_meta", {}),
+                    tensor_data=den_resp.get("tensor_data", {}),
+                    request_id=request_id,
+                )
+                await tracker.enter(request_id, "vae")
+                vae_resp, timings["vae_s"], vae_wid = await dispatch_with_retry(
+                    managers["vae"], request_id, vae_req.model_dump_json(),
+                )
+                await tracker.leave(request_id, "vae", timings["vae_s"])
+                logger.info("[%s] VAE (worker %d): %.2fs", request_id, vae_wid, timings["vae_s"])
+            except Exception:
+                await tracker.mark_failed(request_id)
+                raise
 
         timings["total_s"] = round(sum(timings.values()), 3)
         await tracker.mark_done(request_id)
@@ -269,8 +290,14 @@ async def worker(runtime: DistributedRuntime):
         return web.json_response({"stages": list(results)})
 
     async def handle_pipeline_status(http_request: web.Request) -> web.Response:
-        status = await tracker.status()
-        return web.json_response(status)
+        pipeline = await tracker.status()
+        stages = {name: mgr.status() for name, mgr in managers.items()}
+        pipeline["stages"] = stages
+        pipeline["pipeline_depth"] = {
+            "active": pipeline["active_count"],
+            "max": pipeline_depth,
+        }
+        return web.json_response(pipeline)
 
     async def handle_video(http_request: web.Request) -> web.Response:
         filename = http_request.match_info["filename"]

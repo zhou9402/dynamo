@@ -7,7 +7,7 @@
 #
 # Each stage supports multiple workers: use ';' to separate workers in GPU
 # specs.  Each worker is an independent top-level process; Dynamo discovers
-# them via etcd and the orchestrator round-robins requests automatically.
+# them via etcd and the orchestrator dispatches to specific workers via client.direct().
 #
 # Usage:
 #   ./run_all.sh                    # launch all services (1 worker/stage)

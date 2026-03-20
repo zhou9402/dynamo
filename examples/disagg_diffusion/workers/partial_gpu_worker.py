@@ -57,7 +57,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req, OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req, OutputBatch, RequestMetrics
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -96,11 +96,35 @@ class NixlReceiveStage(PipelineStage):
         # Fallback: tensors arrived via ZMQ pickle — just move to GPU
         return self._device_move(batch)
 
+    _NIXL_PULL_MAX_RETRIES = int(os.environ.get("NIXL_PULL_MAX_RETRIES", "5"))
+    _NIXL_PULL_BACKOFF_S = float(os.environ.get("NIXL_PULL_BACKOFF_S", "0.5"))
+
     def _nixl_pull(self, batch: Req, meta: dict) -> Req:
         from nixl_transfer import NixlTensorReceiver
         if self._receiver is None:
             self._receiver = NixlTensorReceiver()
-        tensors = self._receiver.recv(meta, device="cuda")
+        # Retry on REMOTE_DISCONNECT — NIXL 1:N fan-out can be flaky on
+        # initial peer connection when multiple receivers target one sender.
+        last_err = None
+        for attempt in range(self._NIXL_PULL_MAX_RETRIES + 1):
+            try:
+                tensors = self._receiver.recv(meta, device="cuda")
+                break
+            except Exception as e:
+                if "REMOTE_DISCONNECT" in str(e) and attempt < self._NIXL_PULL_MAX_RETRIES:
+                    import time
+                    wait = self._NIXL_PULL_BACKOFF_S * (attempt + 1)
+                    logger.warning(
+                        "NIXL pull attempt %d/%d failed: %s, retrying in %.1fs",
+                        attempt + 1, self._NIXL_PULL_MAX_RETRIES, e, wait,
+                    )
+                    self._receiver = NixlTensorReceiver()  # fresh receiver
+                    time.sleep(wait)
+                    last_err = e
+                    continue
+                raise
+        else:
+            raise RuntimeError(f"NIXL pull failed after {self._NIXL_PULL_MAX_RETRIES} retries") from last_err
         # Reconstruct indexed fields (e.g. prompt_embeds_0, prompt_embeds_1
         # → prompt_embeds list)
         reconstructed = {}
@@ -163,19 +187,10 @@ class NixlSendStage(PipelineStage):
         self._output_fields = output_fields
         self._sender = None
 
-    @staticmethod
-    def _make_timings() -> object:
-        """Create a RequestTimings object compatible with sglang's executor."""
-        try:
-            from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import RequestTimings
-            return RequestTimings(request_id="nixl-send")
-        except Exception:
-            return None
-
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         tensors = self._extract_tensors(batch)
         if not tensors:
-            return OutputBatch(output={}, timings=self._make_timings())
+            return OutputBatch(output={}, metrics=RequestMetrics(request_id="nixl"))
 
         # Debug: log tensor stats before NIXL send
         for k, t in tensors.items():
@@ -213,7 +228,7 @@ class NixlSendStage(PipelineStage):
         if self._sender is None:
             self._sender = NixlTensorSender()
         meta = self._sender.send(tensors)
-        return OutputBatch(output={"_nixl_transfer_meta": meta}, timings=self._make_timings())
+        return OutputBatch(output={"_nixl_transfer_meta": meta}, metrics=RequestMetrics(request_id="nixl"))
 
     def _fallback_send(self, tensors: Dict[str, torch.Tensor]) -> OutputBatch:
         """Fallback: send raw tensors via ZMQ pickle."""
@@ -231,7 +246,7 @@ class NixlSendStage(PipelineStage):
                 real_key = base[6:]
                 output[real_key] = [idx_map[i] for i in sorted(idx_map)]
                 del output[base]
-        return OutputBatch(output=output, timings=self._make_timings())
+        return OutputBatch(output=output, metrics=RequestMetrics(request_id="nixl"))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -389,7 +404,7 @@ class PartialGPUWorker(GPUWorker):
             stages = self._custom_stages_fn(self.pipeline, self.server_args)
             for stage in stages:
                 name = type(stage).__name__
-                self.pipeline.add_stage(name, stage)
+                self.pipeline.add_stage(stage, name)
 
         if getattr(self.server_args, "dit_layerwise_offload", False) and OffloadableDiTMixin is not None:
             for module_name in [

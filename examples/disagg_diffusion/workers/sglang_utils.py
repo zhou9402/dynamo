@@ -170,6 +170,8 @@ def build_req(
         seed=seed,
         generator=torch.Generator(device="cpu").manual_seed(seed),
         do_classifier_free_guidance=(guidance_scale > 1.0),
+        save_output=False,
+        return_file_paths_only=False,
     )
 
     for k, v in extra_fields.items():
@@ -218,6 +220,8 @@ def inject_tensors_to_req(
 class StageClient:
     """Async ZMQ REQ client that talks to a SGLang Scheduler subprocess."""
 
+    FORWARD_TIMEOUT_S = float(os.environ.get("STAGE_FORWARD_TIMEOUT_S", "120"))
+
     def __init__(self, endpoint: str, name: str = ""):
         import zmq.asyncio
         self._name = name
@@ -228,10 +232,13 @@ class StageClient:
         logger.info("StageClient(%s) connected to %s", name, endpoint)
 
     async def forward(self, reqs):
-        """Send request(s) and receive response."""
+        """Send request(s) and receive response (with timeout)."""
         async with self._lock:
             await self._sock.send_pyobj(reqs)
-            return await self._sock.recv_pyobj()
+            return await asyncio.wait_for(
+                self._sock.recv_pyobj(),
+                timeout=self.FORWARD_TIMEOUT_S,
+            )
 
     def close(self):
         self._sock.close()

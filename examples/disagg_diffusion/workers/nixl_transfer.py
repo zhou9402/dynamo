@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from typing import Dict
 
 import torch
@@ -30,7 +32,9 @@ logger = logging.getLogger(__name__)
 
 try:
     import dynamo.nixl_connect as nixl_connect
-    NIXL_AVAILABLE = True
+    NIXL_AVAILABLE = not os.environ.get("DISABLE_NIXL", "").lower() in ("1", "true", "yes")
+    if not NIXL_AVAILABLE:
+        logger.info("NIXL disabled via DISABLE_NIXL env var")
 except ImportError:
     NIXL_AVAILABLE = False
     logger.info("NIXL not available — falling back to ZMQ tensor transfer")
@@ -52,21 +56,50 @@ class _PersistentConnector:
 class NixlTensorSender:
     """Register GPU tensors as NIXL-readable. Returns metadata for the receiver.
 
-    The readable is kept alive via a background task so the sender process
-    can return immediately after yielding metadata.
+    Buffers are held until the receiver completes the RDMA pull (detected
+    via synchronous ``readable.status`` polling) or a configurable timeout
+    expires.  Previous implementation scheduled a ``_keep_alive`` background
+    task via ``asyncio.ensure_future``, but the event loop only runs during
+    ``run_until_complete`` and stops immediately after — so the background
+    task never executed, leaking GPU memory.
     """
 
+    BUFFER_TIMEOUT_S = float(os.environ.get("NIXL_BUFFER_TIMEOUT_S", "120"))
+
     def __init__(self):
-        self._pending: list = []
+        # Each entry: (readable, flat_buffer_ref, creation_timestamp)
+        self._pending: list[tuple[object, torch.Tensor, float]] = []
 
     def send(self, tensors: Dict[str, torch.Tensor]) -> dict:
         """Register tensors and return metadata dict (synchronous wrapper)."""
+        self._sweep()  # release completed / timed-out buffers first
         return asyncio.get_event_loop().run_until_complete(self._async_send(tensors))
 
-    async def _async_send(self, tensors: Dict[str, torch.Tensor]) -> dict:
-        # Clean completed tasks
-        self._pending = [t for t in self._pending if not t.done()]
+    def _sweep(self):
+        """Poll pending readables: release completed or timed-out buffers."""
+        now = time.monotonic()
+        still_pending = []
+        for readable, flat, created_at in self._pending:
+            try:
+                status = readable.status  # synchronous — calls update_notifs()
+            except Exception:
+                # If status check fails, treat as completed to avoid leak
+                logger.debug("NIXL readable status check failed, releasing buffer")
+                continue
+            if hasattr(status, "name") and status.name == "COMPLETE":
+                logger.debug("NIXL readable completed, releasing buffer")
+            elif str(status) == "OperationStatus.COMPLETE":
+                logger.debug("NIXL readable completed, releasing buffer")
+            elif now - created_at > self.BUFFER_TIMEOUT_S:
+                logger.warning(
+                    "NIXL readable timed out after %.0fs, force-releasing buffer",
+                    now - created_at,
+                )
+            else:
+                still_pending.append((readable, flat, created_at))
+        self._pending = still_pending
 
+    async def _async_send(self, tensors: Dict[str, torch.Tensor]) -> dict:
         connector = await _PersistentConnector.get()
 
         # Flatten all tensors into a single contiguous buffer
@@ -82,15 +115,8 @@ class NixlTensorSender:
             "nixl_metadata": raw_meta.model_dump() if hasattr(raw_meta, "model_dump") else raw_meta,
         }
 
-        # Keep readable alive until the receiver has pulled the data
-        async def _keep_alive():
-            try:
-                await readable.wait_for_completion()
-            except Exception as e:
-                logger.warning("NIXL readable wait failed: %s", e)
-
-        task = asyncio.ensure_future(_keep_alive())
-        self._pending.append(task)
+        # Hold (readable, flat_buffer, timestamp) — prevents GC until sweep releases
+        self._pending.append((readable, flat, time.monotonic()))
         return meta
 
 

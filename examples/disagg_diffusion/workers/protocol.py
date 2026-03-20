@@ -35,6 +35,7 @@ class EncoderResponse(BaseModel):
 
 class DenoiserRequest(BaseModel):
     transfer_meta: Dict[str, Any]
+    tensor_data: Dict[str, Any] = {}
     height: int = 544
     width: int = 960
     num_frames: int = 61
@@ -54,6 +55,7 @@ class DenoiserResponse(BaseModel):
 
 class VAEDecodeRequest(BaseModel):
     transfer_meta: Dict[str, Any]
+    tensor_data: Dict[str, Any] = {}
     request_id: str = ""
 
 
