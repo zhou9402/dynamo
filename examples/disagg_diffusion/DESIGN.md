@@ -1,518 +1,271 @@
-# Disaggregated Diffusion Pipeline — Design Document
+# Disaggregated Diffusion Pipeline - Design Document
 
-## 1. Overview
+## 1. Goal and Scope
 
-### Motivation
+This design splits video generation into three independently scalable stages:
+Encoder -> Denoiser -> VAE.
 
-Modern diffusion pipelines (text-to-video, text-to-image, omni-modal) are
-composed of heterogeneous stages — text encoding, iterative denoising, VAE
-decoding — each with fundamentally different compute profiles:
+The orchestrator handles control-plane scheduling via Dynamo RPC; tensors move
+across stages through NIXL GPU-direct RDMA.
 
-- **Different optimization strategies per stage.** Encoders are
-  memory-bound single-pass transforms; denoisers are compute-bound
-  multi-step loops that benefit from tensor parallelism; VAE decoders
-  are memory-intensive but run only once. Forcing all three into a
-  single process prevents stage-specific tuning (parallelism, batching,
-  memory management, quantization).
+**Current design choices (implementation-aligned):**
+- Multi-worker: each stage runs multiple worker instances.
+- Workers can be added/removed at runtime through etcd discovery without
+  orchestrator restart.
+- Orchestrator does stage routing; current policy is round-robin over idle
+  workers (`WorkerManager` queue order).
+- Pipeline overlap is used to hide transfer overhead behind compute.
+- Tensor buffers are currently temporary allocations per request; this is
+  acceptable with current latency profile and can be upgraded to pooled/buffer
+  management later.
 
-- **Shifting compute balance.** As diffusion models mature, the DiT no
-  longer dominates the entire pipeline — faster denoisers (fewer steps,
-  distilled models) shift the bottleneck to encoding and decoding.
-  Multi-task pipelines are emerging (e.g. OneVideo: encode + denoise +
-  decode + audio in one model) where each task demands independent
-  scaling.
-
-- **Omni-modal future.** Models that jointly produce video, audio,
-  image, and text require stage-level separation so each modality's
-  compute can scale independently without wasting GPU resources.
-
-### Solution
-
-Decompose the pipeline into **N independent stages**, each running as a
-Dynamo RPC worker on dedicated GPU(s).  An orchestrator chains stages
-together, using NIXL RDMA for GPU-direct tensor transfer between them.
-
-| Goal | Mechanism |
+| Goal | Current mechanism |
 |---|---|
-| Stage-level scaling | N workers per stage, auto-discovered via etcd |
-| Pipeline parallelism | Semaphore admission, independent worker pools |
-| GPU-direct transfer | NIXL RDMA — only ~1.5 KB metadata over RPC |
-| Loose coupling | Workers are independent processes, no shared state |
-| Dynamic scaling | Add/remove workers at runtime, no restart |
-| Auto routing | Idle-queue dispatch, backpressure, retry on failure |
+| Stage-level scaling | Worker instances per stage, discovered from etcd |
+| Throughput | Global admission semaphore + per-stage worker pools |
+| Low transfer overhead | RPC sends metadata only (~1.5 KB), tensors use RDMA |
+| Fault containment | Retry on another worker (`STAGE_DISPATCH_RETRIES`) |
+| Runtime elasticity | Add/remove workers without orchestrator restart |
 
+## 2. Architecture and Flow
 
-## 2. Architecture
+### 2.1 Framework Diagram
 
-### 2.1 Architecture Diagram
+```mermaid
+flowchart TB
+    classDef cp fill:#eaf2ff,stroke:#2b5ec8,stroke-width:1.2px,color:#0f172a;
+    classDef dp fill:#fff1f2,stroke:#c0392b,stroke-width:1.2px,color:#0f172a;
+    classDef stage fill:#f8fafc,stroke:#475569,stroke-width:1.2px,color:#0f172a;
+    classDef ext fill:#eef2f7,stroke:#64748b,stroke-width:1.2px,color:#0f172a;
 
-```
-                              ┌───────────┐
-                              │   etcd    │
-                              │ registry  │
-                              └─────┬─────┘
-                           register │ discover
-    ┌───────────────────────────────┼───────────────────────────────┐
-    │                         Orchestrator                          │
-    │                                                               │
-    │  HTTP ──► handle_generate() ──► dispatch_with_retry()         │
-    │           PipelineTracker        per-stage WorkerManager      │
-    │           Semaphore(depth)       acquire → direct() → release │
-    │                                                               │
-    └──────┬──────────────────────┬──────────────────────┬──────────┘
-           │ Dynamo RPC           │ Dynamo RPC            │ Dynamo RPC
-           │ (JSON ~1 KB)         │ (NIXL meta ~1.5 KB)   │ (NIXL meta ~1.5 KB)
-           ▼                      ▼                       ▼
-      ┌──────────┐          ┌──────────┐            ┌──────────┐
-      │Encoder-0 │──────────│Denoiser-0│────────────│  VAE-0   │
-      │  GPU 0   │  NIXL    │ GPU 1,2  │    NIXL    │  GPU 5   │
-      └──────────┘  RDMA    └──────────┘    RDMA    └──────────┘
-      ┌──────────┐          ┌──────────┐            ┌──────────┐
-      │Encoder-1 │──────────│Denoiser-1│────────────│  VAE-1   │
-      │  GPU 3   │  NIXL    │ GPU 4,5  │    NIXL    │  GPU 7   │
-      └──────────┘  RDMA    └──────────┘    RDMA    └──────────┘
-          ...↕                  ...↕                    ...↕
-       dynamic               dynamic                 dynamic
-       add/remove            add/remove              add/remove
-```
+    Client[Client]
+    Etcd[(etcd)]
+    Orch[Orchestrator]
 
-**Key points:**
-- Workers self-register with etcd; the orchestrator discovers them
-  automatically.
-- Dynamo RPC carries only small JSON payloads and NIXL metadata
-  (~1.5 KB). Actual tensors (embeddings, latents) transfer GPU-to-GPU
-  via NIXL RDMA, never touching the CPU or RPC channel.
-- Each stage can have a different number of workers and GPU count.
-  The denoiser typically uses TP > 1 (multi-GPU), while encoder and VAE
-  each use a single GPU.
+    subgraph CP[Control Plane]
+        direction TB
+        Orch -->|Dynamo RPC + metadata| EncPool
+        Orch -->|Dynamo RPC + metadata| DenPool
+        Orch -->|Dynamo RPC + metadata| VaePool
+    end
 
-### 2.2 Process Model
+    subgraph EncPool[Encoder Workers]
+        direction TB
+        E1[encoder-0]
+        E2[encoder-1]
+    end
 
-Each worker is an independent OS process with no shared state:
+    subgraph DenPool[Denoiser Workers]
+        direction TB
+        D1[denoiser-0]
+        D2[denoiser-1]
+    end
 
-```
-Dynamo Worker Process (e.g. encoder_worker.py)
-├── @dynamo_worker                          ← Dynamo runtime bootstrap
-│   ├── serve_endpoint("generate")          ← Dynamo RPC from orchestrator
-│   │   └── handle_generate()
-│   │       └── StageClient.forward()       ← ZMQ to local backend subprocess
-│   └── serve_endpoint("health")
-│
-└── Backend subprocess (spawned at startup)
-    └── Inference engine (any backend)
-        ├── ReceiveStage   ← RDMA-pull tensors from previous stage
-        ├── ComputeStage   ← model-specific inference
-        └── SendStage      ← register output tensors as RDMA-readable
+    subgraph VaePool[VAE Workers]
+        direction TB
+        V1[vae-0]
+        V2[vae-1]
+    end
+
+    subgraph DP[Data Plane]
+        direction LR
+        EncPool -->|NIXL RDMA embeddings| DenPool
+        DenPool -->|NIXL RDMA latents| VaePool
+    end
+
+    Client -->|HTTP| Orch
+    Etcd -->|register/discover| Orch
+    VaePool -->|video.mp4| Client
+    DenPool -. notify free buffer .-> EncPool
+    VaePool -. notify free buffer .-> DenPool
+
+    class CP cp;
+    class DP dp;
+    class EncPool,DenPool,VaePool,Orch,Client,Etcd,E1,E2,D1,D2,V1,V2 stage;
 ```
 
-- The Dynamo worker process handles RPC and control-plane logic.
-- The backend subprocess runs the actual model inference. It can be any
-  inference engine — SGLang, vLLM, a custom PyTorch loop, etc.
-- Communication between the two is via ZMQ REQ/REP (same-host IPC).
+**Read this diagram as two planes:**
+- **Control plane:** client request, worker discovery, and RPC dispatch.
+- **Data plane:** embeddings and latents transferred GPU-to-GPU through NIXL.
+- **Buffer lifecycle:** downstream stage notifies upstream to release sender buffers.
 
-### 2.3 Loose Coupling & Dynamic Scaling
+### 2.2 Request Flow Diagram
 
-Workers are completely independent — they know nothing about each other
-or the orchestrator:
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant O as Orchestrator
+    participant E as Encoder worker
+    participant D as Denoiser worker
+    participant V as VAE worker
 
-- **Startup:** Worker process starts → registers with etcd (via Dynamo
-  runtime) → orchestrator auto-discovers the new instance.
-- **Shutdown:** Worker process exits → etcd lease expires →
-  orchestrator stops routing to it.
-- **Add worker:** Start a new process on any available GPU → etcd →
-  orchestrator sees it within seconds. No restart, no reconfiguration.
-- **Remove worker:** Kill the process → etcd lease expires → traffic
-  drains naturally.
-- **Auto-scale:** An external controller can monitor queue depth per
-  stage (`GET /pipeline/status`) and spawn/kill workers as needed.
+    rect rgb(235, 245, 255)
+        Note over C,O,E,D,V: Control Plane (HTTP + Dynamo RPC + metadata)
+        C->>O: POST /v1/videos/generations
+        O->>E: EncoderRequest(prompt, cfg)
+        E-->>O: transfer_meta (embeddings, ~1.5KB)
+        O->>D: DenoiserRequest(meta, params)
+        D-->>O: transfer_meta (latents, ~1.5KB)
+        O->>V: VAEDecodeRequest(meta, request_id)
+        V-->>O: video_path
+        O-->>C: {url, timings}
+    end
 
-### 2.4 Auto Routing
+    rect rgb(255, 241, 242)
+        Note over E,D,V: Data Plane (NIXL RDMA tensor transfer)
+        D->>E: RDMA pull embeddings (GPU->GPU)
+        V->>D: RDMA pull latents (GPU->GPU)
+    end
 
-Each stage has a `WorkerManager` that maintains an idle-pool queue:
-
-```
-WorkerManager("denoiser", client, [0, 1, 2])
-│
-├── _idle_queue: asyncio.Queue  ← [0, 1, 2] initially
-│
-├── acquire_worker() → int      ← blocks until a worker is idle
-├── dispatch(wid, rid, json)    ← client.direct(json, wid)
-│   └── on completion/failure → release wid back to _idle_queue
-│
-└── status() → dict             ← per-worker completed/latency/state
-```
-
-- `acquire_worker()` blocks the caller when all workers are busy
-  (backpressure).
-- `dispatch()` sends to a specific worker via `client.direct()` and
-  tracks busy/idle state for observability.
-- `dispatch_with_retry()` wraps this: on failure, acquires a different
-  worker and retries (configurable via `STAGE_DISPATCH_RETRIES`).
-
-### 2.5 Request Flow
-
-A single video generation request follows this path:
-
-```
-Client                 Orchestrator           Encoder-k     Denoiser-j     VAE-i
-  │                        │                      │              │            │
-  │─POST /v1/videos/──────►│                      │              │            │
-  │  generations            │                      │              │            │
-  │                    [acquire semaphore]          │              │            │
-  │                         │                      │              │            │
-  │                         │──EncoderRequest──────►│              │            │
-  │                         │  (prompt, cfg)   [encode text]      │            │
-  │                         │◄──NIXL metadata──────│              │            │
-  │                         │   (~1.5 KB)          │              │            │
-  │                         │                      │              │            │
-  │                         │──DenoiserRequest───────────────────►│            │
-  │                         │  (NIXL meta, params)      [RDMA pull embeddings]│
-  │                         │                           [denoise N steps]     │
-  │                         │◄──NIXL metadata────────────────────│            │
-  │                         │                                     │            │
-  │                         │──VAEDecodeRequest──────────────────────────────►│
-  │                         │  (NIXL meta, req_id)                [RDMA pull] │
-  │                         │                                     [decode]    │
-  │                         │◄──{video_path}──────────────────────────────────│
-  │                    [release semaphore]          │              │            │
-  │◄──{url, timings}───────│                       │              │            │
+    Note over O,E,D,V: Routing: round-robin over idle workers
+    Note over O,E,D,V: Overlap: requests run concurrently across stages
 ```
 
-Only ~1.5 KB of NIXL metadata travels over Dynamo RPC between stages.
-The actual tensor data (embeddings: ~tens of MB, latents: ~hundreds of
-MB) transfers GPU-to-GPU via NIXL RDMA without CPU involvement.
+**Single request path (with plane separation):**
+1. Client sends `POST /v1/videos/generations`.
+2. Orchestrator dispatches `EncoderRequest` and receives embedding metadata.
+3. Orchestrator dispatches `DenoiserRequest` with metadata + inference params.
+4. Orchestrator dispatches `VAEDecodeRequest` and receives `video_path`.
+5. Client receives `{url, timings}`.
 
-### 2.6 Pipeline Parallelism
+**How routing and overlap work now:**
+- Routing policy: round-robin among currently idle workers in each stage.
+- Overlap behavior: requests can occupy different stages concurrently
+  (Encode/Denoise/Decode overlap), which hides most control/data transfer cost.
 
-An `asyncio.Semaphore(pipeline_depth)` gates admission. Each stage has
-its own independent worker pool, so multiple requests overlap:
+### 2.3 Runtime Model
 
-```
-Time ──────────────────────────────────────────────────►
+Each stage worker is an isolated process:
+- **Dynamo worker process:** serves `generate` and `health` endpoints.
+- **Backend subprocess:** executes stage pipeline through `StageClient` (ZMQ REQ/REP).
+- **No shared memory/state between workers:** scaling and failure domains stay clean.
 
-Req A: [Enc-0][======Den-0======][VAE-0]
-Req B:    [Enc-1][======Den-1======][VAE-1]
-Req C:       [Enc-0][======Den-0======][VAE-0]
-Req D:          [Enc-1][======Den-1======][VAE-1]
-```
+## 3. Key Components
 
-- `pipeline_depth` defaults to `MAX_PIPELINE_DEPTH` (env, default 4)
-  or the total number of workers across all stages.
-- Each request independently acquires workers from each stage's pool.
-- The denoiser is typically the bottleneck (50 diffusion steps), so
-  encoder and VAE workers are freed quickly to serve other requests.
+### 3.1 Orchestrator (`orchestrator/run_disagg.py`)
 
+Responsibilities:
+- Initialize stage clients and discover worker instance IDs.
+- Enforce global concurrency via `asyncio.Semaphore(pipeline_depth)`.
+- Chain Encoder -> Denoiser -> VAE with per-stage timing.
+- Route each stage call to an idle worker using round-robin queue order.
+- Expose API and observability endpoints.
 
-## 3. Component Design
-
-### 3.1 Orchestrator
-
-`orchestrator/run_disagg.py` — aiohttp HTTP server that chains stages.
-
-**Endpoints:**
-
-| Method | Path | Description |
+| Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/v1/videos/generations` | Submit generation request |
+| `POST` | `/v1/videos/generations` | Run full pipeline |
 | `GET` | `/health` | Orchestrator liveness |
-| `GET` | `/health/stages` | Per-stage health (queries each worker) |
-| `GET` | `/pipeline/status` | Active requests, queue depth, latencies |
-| `GET` | `/videos/<filename>` | Serve generated video file |
+| `GET` | `/health/stages` | Fan-out health to stage workers |
+| `GET` | `/pipeline/status` | Active requests, queue depth, worker stats |
+| `GET` | `/videos/<filename>` | Return generated MP4 |
 
-**Key components:**
+### 3.2 Worker Pooling (`orchestrator/worker_manager.py`)
 
-- `PipelineTracker` — Tracks active requests per stage, completed/failed
-  counts, and rolling average stage latencies.
-- `dispatch_with_retry(mgr, request_id, json)` — Acquire worker →
-  dispatch → on failure retry on a different worker (up to
-  `STAGE_DISPATCH_RETRIES` attempts).
-- `admission = asyncio.Semaphore(pipeline_depth)` — Limits concurrent
-  in-flight requests across the entire pipeline.
+`WorkerManager` maintains:
+- idle queue (`acquire_worker()` blocks on backpressure),
+- direct dispatch to worker ID (`client.direct(...)`),
+- per-worker runtime stats (`status`, `completed`, `avg_latency_s`, `queue_depth`).
 
-### 3.2 WorkerManager
+### 3.3 Stage Workers (`workers/*_worker.py`)
 
-`orchestrator/worker_manager.py` — Per-stage worker pool with
-busy/idle tracking.
+Common pattern:
+- launch backend scheduler subprocess (`launch_stage_server(...)`),
+- run Dynamo RPC handlers (`generate`, `health`),
+- forward requests through `StageClient.forward(...)`.
 
-```python
-class WorkerManager:
-    def __init__(self, stage_name: str, client, worker_ids: List[int]): ...
-    async def acquire_worker(self) -> int: ...       # blocks until idle
-    async def dispatch(self, worker_id, request_id, request_json) -> (dict, float): ...
-    def status(self) -> dict: ...                    # per-worker stats
-```
+Design direction: keep worker/orchestrator logic stable and swap only backend
+handler implementation (`sglang`, `diffusers`, or others).
 
-- Backed by `asyncio.Queue` (idle pool) — `acquire_worker()` awaits
-  the queue, `dispatch()` returns the worker to it on completion.
-- `_call_direct()` sends to a specific worker via
-  `client.direct(json, worker_id)`.
-- `status()` returns per-worker `{id, status, request_id, completed,
-  avg_latency_s}` plus stage-level `{queue_depth, completed, failed}`.
+Stage IO contract:
 
-### 3.3 Worker Interface
+| Stage | Input | Output |
+|---|---|---|
+| Encoder | prompt + guidance | `transfer_meta` for embeddings |
+| Denoiser | embedding metadata + denoise params | `transfer_meta` for latents |
+| VAE | latent metadata + request ID | `video_path` |
 
-All three workers follow an identical pattern:
+Fallback path: if NIXL is unavailable, tensors are serialized over RPC (`tensor_data`).
 
-```python
-@dynamo_worker(enable_nats=False)
-async def worker(runtime: DistributedRuntime):
-    # 1. Launch backend subprocess
-    processes, client, server_args = launch_stage_server(
-        MODEL_PATH, required_modules, build_stage_fn, SCHEDULER_PORT,
-    )
+### 3.4 Tensor Transport (`workers/nixl_transfer.py`)
 
-    # 2. Define Dynamo RPC handlers
-    async def handle_generate(request, context):
-        output = await client.forward([build_req(...)])
-        yield result_dict  # JSON response with NIXL metadata or output
+`NixlTensorSender`:
+- flattens tensors into one GPU buffer,
+- registers a readable descriptor,
+- returns compact metadata and tracks pending buffers.
 
-    async def handle_health(request, context):
-        yield {"status": "ok", "stage": "..."}
+`NixlTensorReceiver`:
+- allocates destination GPU buffer,
+- performs RDMA read,
+- reconstructs tensors from metadata.
 
-    # 3. Serve endpoints
-    gen_ep = runtime.endpoint("disagg_diffusion.<stage>.generate")
-    health_ep = runtime.endpoint("disagg_diffusion.<stage>.health")
-    await asyncio.gather(
-        gen_ep.serve_endpoint(handle_generate),
-        health_ep.serve_endpoint(handle_health),
-    )
-```
+**Buffer strategy (current vs future):**
+- Current: request-scoped temporary buffer allocation; simple and sufficient
+  because measured overhead share is small.
+- Future: buffer pooling/manager for tighter latency control and memory reuse
+  under higher concurrency.
 
-Each worker:
-- Spawns a backend subprocess (which loads model weights and runs
-  inference).
-- Bridges Dynamo RPC ↔ backend via `StageClient` (async ZMQ).
-- Handles NIXL metadata forwarding: output from one stage's send
-  becomes the next stage's receive metadata.
-- Includes a ZMQ fallback path: when NIXL is unavailable, tensors are
-  serialized via `torch.save()` + base64 over the RPC channel.
+## 4. SGLang-Specific Integration
 
-**Stage-specific behavior:**
+The back half should be backend-agnostic. The recommended design is a generic
+`StageHandler` contract, with framework-specific implementations.
 
-| Stage | Input | Compute | Output |
-|---|---|---|---|
-| Encoder | prompt text | Text encoding | NIXL metadata (embeddings) |
-| Denoiser | NIXL metadata (embeddings) + params | RDMA pull → N denoise steps | NIXL metadata (latents) |
-| VAE | NIXL metadata (latents) | RDMA pull → VAE decode | video file path |
-
-### 3.4 Tensor Transfer (NIXL)
-
-`workers/nixl_transfer.py` — GPU-direct RDMA transfer between stages.
-
-**Sender (`NixlTensorSender`):**
+### 4.1 Generic StageHandler Abstraction
 
 ```python
-sender = NixlTensorSender()
-meta = sender.send({"latents": tensor})   # → ~1.5 KB metadata dict
+class StageHandler:
+    async def start(self) -> None: ...
+    async def generate(self, request: dict) -> dict: ...
+    async def health(self) -> dict: ...
+    async def shutdown(self) -> None: ...
 ```
 
-1. Flatten all tensors into a single contiguous GPU buffer
-   (`torch.cat`).
-2. Create a NIXL `Descriptor` wrapping the flat buffer.
-3. Register as `readable` via `connector.create_readable(descriptor)`.
-4. Return metadata: tensor keys, shapes, dtypes, NIXL descriptor.
-5. Hold `(readable, flat_buffer, timestamp)` in `_pending` list.
-6. `_sweep()` polls `readable.status` on each subsequent `send()` —
-   releases buffers on `COMPLETE` or timeout (`NIXL_BUFFER_TIMEOUT_S`,
-   default 120s).
+Worker responsibility stays unchanged:
+- parse Dynamo request/response protocol,
+- call `handler.generate(...)`,
+- return stage output (`transfer_meta` or `video_path`).
 
-**Receiver (`NixlTensorReceiver`):**
+Backend-specific logic moves into handlers:
+- process launch and model init,
+- stage graph / pipeline execution,
+- tensor extraction/injection details.
 
-```python
-receiver = NixlTensorReceiver()
-tensors = receiver.recv(meta, device="cuda")  # → {"latents": tensor}
-```
+### 4.2 Current Handler: SGLang
 
-1. Parse metadata to compute total byte size and per-tensor specs.
-2. Allocate a flat `torch.uint8` buffer directly on the target GPU.
-3. `connector.begin_read(rdma_meta, descriptor)` → RDMA pull from
-   sender's GPU.
-4. `read_op.wait_for_completion()` — blocks until transfer finishes.
-5. Slice the flat buffer into individual tensors using stored shapes
-   and dtypes.
+Current implementation maps to an SGLang handler using
+`workers/partial_gpu_worker.py`:
+- `NixlReceiveStage` at denoiser/VAE entry,
+- `NixlSendStage` at encoder/denoiser exit.
 
-### 3.5 Protocol Types
+Stage builders:
+- `build_encoder_stages()`: `TextEncodingStage -> NixlSendStage`
+- `build_denoiser_stages()`: `NixlReceiveStage -> ... -> DenoisingStage -> NixlSendStage`
+- `build_vae_stages()`: `NixlReceiveStage -> DecodingStage`
 
-`workers/protocol.py` — Pydantic models for Dynamo RPC serialization.
+### 4.3 Alternative Handler: Diffusers (Planned)
 
-```python
-class EncoderRequest(BaseModel):
-    prompt: str
-    negative_prompt: str = ""
-    guidance_scale: float = 1.0
+A diffusers handler should implement the same contract and keep the same
+orchestrator protocol:
+- input/output request schema unchanged,
+- same NIXL metadata fields for stage handoff,
+- same health/reporting behavior.
 
-class DenoiserRequest(BaseModel):
-    transfer_meta: Dict[str, Any]     # NIXL metadata from encoder
-    tensor_data: Dict[str, Any] = {}  # ZMQ fallback
-    height: int = 544
-    width: int = 960
-    num_frames: int = 61
-    num_inference_steps: int = 50
-    guidance_scale: float = 1.0
-    seed: int = 42
+This allows swapping `sglang` -> `diffusers` without changing orchestrator
+routing, worker manager, or external API.
 
-class VAEDecodeRequest(BaseModel):
-    transfer_meta: Dict[str, Any]     # NIXL metadata from denoiser
-    tensor_data: Dict[str, Any] = {}  # ZMQ fallback
-    request_id: str = ""
-```
+Decision note: keep orchestrator as a standalone component for now; evaluate
+merging into a router layer only after smart-routing requirements justify it.
 
-Responses carry either `transfer_meta` (NIXL path) or `tensor_data`
-(ZMQ fallback) but never both.
+## 5. Roadmap (Condensed)
 
-
-## 4. Implementation: SGLang Backend
-
-This section describes the current backend implementation using SGLang's
-multimodal generation runtime, with HunyuanVideo as the reference model.
-The generic architecture (Sections 1-3) is backend-agnostic — any
-inference engine that can run pipeline stages can replace SGLang.
-
-### 4.1 PartialGPUWorker
-
-`workers/partial_gpu_worker.py` — Extends SGLang's `GPUWorker` to load
-only the modules each stage needs.
-
-```python
-class PartialGPUWorker(GPUWorker):
-    def __init__(self, required_modules, custom_stages_fn, **kwargs): ...
-    def init_device_and_model(self):
-        # 1. Set up distributed environment (TP, SP, CFG parallel)
-        # 2. build_partial_pipeline() — load only required_modules
-        # 3. custom_stages_fn(pipeline, server_args) — build stage list
-        # 4. Register stages with pipeline
-```
-
-- Overrides only `init_device_and_model()`. All other `GPUWorker`
-  behavior (forward execution, memory analysis, LoRA) is inherited.
-- `build_partial_pipeline()` (`sglang_utils.py`) dynamically creates a
-  subclass of the model's pipeline that suppresses automatic stage
-  creation and LoRA initialization, loading only the specified modules.
-
-**Custom pipeline stages (NIXL integration):**
-
-- `NixlReceiveStage(PipelineStage)` — Prepended at the start of
-  denoiser/VAE pipelines. Reads `_nixl_transfer_meta` from the `Req`
-  and RDMA-pulls tensors. Falls back to device-move for ZMQ path.
-  Includes retry logic for `REMOTE_DISCONNECT` errors.
-- `NixlSendStage(PipelineStage)` — Appended as the last stage in
-  encoder/denoiser pipelines. Extracts tensors from `Req`, registers
-  with NIXL, returns `OutputBatch` containing only metadata.
-
-**Stage builders** (picklable functions passed to subprocess):
-
-| Function | Stages |
-|---|---|
-| `build_encoder_stages()` | `TextEncodingStage` → `NixlSendStage` |
-| `build_denoiser_stages()` | `NixlReceiveStage` → `LatentPreparationStage` → `TimestepPreparationStage` → `DenoisingStage` → `NixlSendStage` |
-| `build_vae_stages()` | `NixlReceiveStage` → `DecodingStage` |
-
-### 4.2 Subprocess Launcher
-
-`workers/partial_gpu_worker.py:launch_partial_server()` — Spawns
-SGLang Scheduler subprocess(es) with `PartialGPUWorker` monkey-patched
-in place of the default `GPUWorker`.
-
-```
-launch_partial_server(server_args, required_modules, custom_stages_fn)
-│
-├── For each GPU (rank 0..N-1):
-│   ├── Create readiness pipe
-│   ├── mp.Process(target=_run_partial_scheduler_process)
-│   │   ├── Monkey-patch: sched_mod.GPUWorker = _PatchedGPUWorker
-│   │   └── run_scheduler_process(...)  ← standard SGLang entry point
-│   └── Start process
-│
-├── Wire master/slave pipes (TP > 1: rank 0 is master, ranks 1..N are slaves)
-├── Wait for all readiness signals
-└── Return process list
-```
-
-`launch_stage_server()` (`sglang_utils.py`) wraps this with config
-setup: `patch_hunyuan_config()` → `ServerArgs.from_kwargs()` →
-`launch_partial_server()` → `StageClient(endpoint)`.
-
-### 4.3 StageClient
-
-`workers/sglang_utils.py:StageClient` — Async ZMQ REQ/REP client
-connecting the Dynamo worker main process to the SGLang Scheduler
-subprocess.
-
-```python
-class StageClient:
-    def __init__(self, endpoint: str, name: str = ""): ...
-    async def forward(self, reqs):    # send_pyobj → recv_pyobj with timeout
-    def close(self): ...
-```
-
-- `asyncio.Lock` serializes concurrent calls (ZMQ REQ socket is
-  single-flight).
-- Configurable timeout: `STAGE_FORWARD_TIMEOUT_S` (default 120s).
-
-### 4.4 HunyuanVideo Specifics
-
-- **Dual encoder detection:** `detect_encoder_modules()` reads
-  `model_index.json` and auto-detects `text_encoder_2` / `tokenizer_2`
-  (HunyuanVideo uses Llama + CLIP). Falls back to heuristic for known
-  model names.
-- **HunyuanConfig patching:** `patch_hunyuan_config()` wraps
-  `HunyuanConfig.__init__` to supply `task_type=T2V` when omitted
-  (the base class requires it but HunyuanConfig doesn't default it).
-- **Triton norm contiguous workaround:**
-  `_patch_triton_norm_contiguous()` wraps SGLang's triton
-  `norm_infer` to call `.contiguous()` on non-contiguous tensors from
-  HunyuanVideo's attention reshapes, avoiding the triton kernel
-  assertion `x.stride(-1) == 1`.
-- **Component config sync:** `_sync_all_component_configs()` reads
-  `config.json` for every component in `model_index.json` and updates
-  `server_args.pipeline_config`, ensuring correct parameters (e.g.
-  `z_dim`) even for components whose weights are not loaded by the
-  current stage.
-
-
-## 5. Roadmap
-
-- [x] Multi-worker scaling — N workers per stage, etcd auto-discovery
-- [x] Pipeline parallelism — overlapping requests across stages
-- [x] NIXL GPU-direct transfer — GPU-to-GPU RDMA, only metadata over RPC
-- [ ] Runtime scaling — add/remove workers without restart;
-      external auto-scaler integration based on queue depth
-- [ ] Smart routing — load-aware dispatch (not just idle-queue),
-      affinity-based routing, request priority
-- [ ] Fault tolerance — worker health-check + eviction,
-      dead worker detection, graceful degradation
-- [ ] Streaming output — stream decoded frames as produced
-- [ ] Metrics & observability — per-stage latency histograms,
-      GPU utilization, NIXL throughput, Prometheus export
-- [ ] Request cancellation — cancel in-flight requests, free GPU
-      immediately
-- [ ] Multi-model support — OneVideo, omni-modal pipelines,
-      heterogeneous stage graphs (not just linear 3-stage)
-
-
-## 6. File Map
-
-```
-examples/disagg_diffusion/
-├── DESIGN.md                           ← this document
-├── README.md                           ← usage guide and quick start
-├── run_all.sh                          ← launch etcd + all workers + orchestrator
-├── stress_test.sh                      ← concurrent load testing script
-│
-├── orchestrator/
-│   ├── run_disagg.py                   ← HTTP server, PipelineTracker, dispatch_with_retry
-│   └── worker_manager.py              ← WorkerManager: idle-pool, acquire/dispatch/status
-│
-├── workers/
-│   ├── __init__.py
-│   ├── protocol.py                     ← Pydantic request/response models (Dynamo RPC)
-│   ├── encoder_worker.py              ← Encoder Dynamo worker (text encoding → NIXL send)
-│   ├── denoiser_worker.py             ← Denoiser Dynamo worker (NIXL recv → denoise → NIXL send)
-│   ├── vae_worker.py                  ← VAE Dynamo worker (NIXL recv → decode → save video)
-│   ├── nixl_transfer.py               ← NixlTensorSender / NixlTensorReceiver (RDMA)
-│   ├── partial_gpu_worker.py          ← PartialGPUWorker, NixlSend/ReceiveStage, subprocess launcher
-│   └── sglang_utils.py               ← StageClient, build_partial_pipeline, launch_stage_server
-│
-└── validate/
-    └── validate_split.py              ← validation script for split correctness
-```
+- [x] Multi-worker per stage with etcd discovery
+- [x] Pipeline overlap with global admission control
+- [x] NIXL metadata-only RPC + GPU-direct tensor transfer
+- [ ] Runtime auto-scaling from `/pipeline/status`
+- [ ] Smarter routing (affinity/priority/load-aware)
+- [ ] Fault tolerance hardening and graceful degradation
+- [ ] Streaming decode output + richer observability
+- [ ] Evaluate merging orchestrator into router layer
+- [ ] Explore diffusion-based smart router for stage/worker selection
+- [ ] Formalize `StageHandler` interface and migrate SGLang to handler plugin
+- [ ] Add Diffusers handler with parity tests against SGLang outputs

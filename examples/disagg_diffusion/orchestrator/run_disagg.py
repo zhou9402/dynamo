@@ -48,6 +48,8 @@ from protocol import (  # noqa: E402
 )
 from dynamo.runtime import DistributedRuntime, dynamo_worker  # noqa: E402
 from worker_manager import WorkerManager  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
+from request_validation import validate_generate_http_body  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -148,17 +150,24 @@ async def worker(runtime: DistributedRuntime):
 
     # Wait for additional workers that may still be registering.
     # wait_for_instances() returns after the first instance; model loading
-    # times vary, so poll until the count stabilizes or timeout.
+    # times vary, so observe all stages for a short settle window.
     WORKER_SETTLE_S = int(os.environ.get("WORKER_SETTLE_S", "30"))
     if WORKER_SETTLE_S > 0:
         import time as _time
         deadline = _time.monotonic() + WORKER_SETTLE_S
-        prev_count = 0
+        prev_counts = (-1, -1, -1)
         while _time.monotonic() < deadline:
-            cur = len(denoiser_client.instance_ids())
-            if cur > prev_count:
-                prev_count = cur
-                logger.info("Discovered %d denoiser(s) so far, waiting for more…", cur)
+            cur_counts = (
+                len(encoder_client.instance_ids()),
+                len(denoiser_client.instance_ids()),
+                len(vae_client.instance_ids()),
+            )
+            if cur_counts != prev_counts:
+                logger.info(
+                    "Discovered workers so far: encoder=%d denoiser=%d vae=%d",
+                    cur_counts[0], cur_counts[1], cur_counts[2],
+                )
+                prev_counts = cur_counts
             await asyncio.sleep(2)
         logger.info("Worker settle period done (%ds)", WORKER_SETTLE_S)
 
@@ -285,10 +294,20 @@ async def worker(runtime: DistributedRuntime):
     async def handle_post(http_request: web.Request) -> web.Response:
         try:
             body = await http_request.json()
-            if "prompt" not in body:
-                return web.json_response({"error": "missing 'prompt' field"}, status=400)
-            result = await handle_generate(body)
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+
+        try:
+            req_dict = validate_generate_http_body(body)
+            result = await handle_generate(req_dict)
             return web.json_response(result)
+        except ValidationError as e:
+            return web.json_response(
+                {"error": "invalid request", "details": e.errors()},
+                status=400,
+            )
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             logger.error("Request failed: %s", e, exc_info=True)
             return web.json_response({"error": str(e)}, status=500)

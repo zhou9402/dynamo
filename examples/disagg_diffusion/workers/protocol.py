@@ -11,7 +11,7 @@ partial_gpu_worker.py and nixl_transfer.py.
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
@@ -25,8 +25,8 @@ class EncoderRequest(BaseModel):
 
 
 class EncoderResponse(BaseModel):
-    transfer_meta: Dict[str, Any] = {}
-    shapes: Dict[str, List[int]] = {}
+    transfer_meta: Dict[str, Any] = Field(default_factory=dict)
+    shapes: Dict[str, List[int]] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +35,7 @@ class EncoderResponse(BaseModel):
 
 class DenoiserRequest(BaseModel):
     transfer_meta: Dict[str, Any]
-    tensor_data: Dict[str, Any] = {}
+    tensor_data: Dict[str, Any] = Field(default_factory=dict)
     height: int = 544
     width: int = 960
     num_frames: int = 61
@@ -45,8 +45,8 @@ class DenoiserRequest(BaseModel):
 
 
 class DenoiserResponse(BaseModel):
-    transfer_meta: Dict[str, Any] = {}
-    shape: List[int] = []
+    transfer_meta: Dict[str, Any] = Field(default_factory=dict)
+    shape: List[int] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +55,7 @@ class DenoiserResponse(BaseModel):
 
 class VAEDecodeRequest(BaseModel):
     transfer_meta: Dict[str, Any]
-    tensor_data: Dict[str, Any] = {}
+    tensor_data: Dict[str, Any] = Field(default_factory=dict)
     request_id: str = ""
 
 
@@ -76,7 +76,7 @@ class GenerateRequest(BaseModel):
     num_frames: int = 61
     num_inference_steps: int = 50
     guidance_scale: float = 1.0
-    seed: int = 42
+    seed: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
