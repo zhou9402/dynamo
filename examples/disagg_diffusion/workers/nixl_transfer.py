@@ -81,18 +81,14 @@ if NIXL_AVAILABLE:
 # Helpers
 # ---------------------------------------------------------------------------
 
+_event_loop = None
+
 def _run_coro(coro):
     """Run a coroutine from synchronous context (sglang scheduler thread)."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Shouldn't happen in sglang's scheduler, but be safe
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                return pool.submit(asyncio.run, coro).result(timeout=30)
-        return loop.run_until_complete(coro)
-    except RuntimeError:
-        return asyncio.run(coro)
+    global _event_loop
+    if _event_loop is None or _event_loop.is_closed():
+        _event_loop = asyncio.new_event_loop()
+    return _event_loop.run_until_complete(coro)
 
 
 # ---------------------------------------------------------------------------
@@ -123,11 +119,33 @@ class NixlTensorSender:
     async def _async_send(
         self, tensors: Dict[str, torch.Tensor]
     ) -> Tuple[dict, object]:
+        import time as _time
+        t0 = _time.monotonic()
+
         # Flatten all tensors into a single contiguous buffer
-        flat = torch.cat([t.contiguous().view(-1) for t in tensors.values()])
+        vals = list(tensors.values())
+        if len(vals) == 1:
+            flat = vals[0].contiguous().view(-1)
+        else:
+            flat = torch.cat([t.contiguous().view(-1) for t in vals])
+        t1 = _time.monotonic()
+
         descriptor = nixl_connect.Descriptor(flat)
+        t2 = _time.monotonic()
+
         readable = await self.connector.create_readable(descriptor)
+        t3 = _time.monotonic()
+
         raw_meta = readable.metadata()
+        t4 = _time.monotonic()
+
+        logger.info(
+            "NIXL send breakdown: flatten=%.1fms descriptor=%.1fms "
+            "create_readable=%.1fms metadata=%.1fms total=%.1fms "
+            "(buf=%s %.2fMB)",
+            (t1-t0)*1000, (t2-t1)*1000, (t3-t2)*1000, (t4-t3)*1000,
+            (t4-t0)*1000, list(flat.shape), flat.nbytes/1e6,
+        )
 
         meta = {
             "tensor_keys": list(tensors.keys()),
